@@ -116,28 +116,40 @@ export default function PawDetectShell() {
   }, [modelStatus, previewUrl]);
 
   return (
-    <div className="flex min-h-dvh flex-col bg-neutral-50">
+    <div className="relative isolate flex min-h-dvh flex-col bg-neutral-50">
+      {/* Ambient backdrop — subtle brand-tinted glow behind the hero. */}
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[480px] bg-gradient-to-b from-brand/[0.045] via-white/40 to-transparent"
+      />
+      <div
+        aria-hidden
+        className="pointer-events-none absolute left-1/2 top-28 -z-10 h-[320px] w-[820px] -translate-x-1/2 rounded-full bg-brand/5 blur-3xl"
+      />
+
       <Header />
       <main className="flex-1">
-        <section className="mx-auto w-full max-w-3xl px-4 pt-12 pb-12 sm:px-6 sm:pt-16">
+        <section className="mx-auto w-full max-w-3xl px-4 pt-14 pb-16 sm:px-6 sm:pt-20">
           <div className="animate-fade-in-up text-center">
-            <h1 className="text-3xl font-semibold tracking-tight text-neutral-900 sm:text-4xl">
-              Classify cats and dogs from any photo.
+            <h1 className="text-4xl font-semibold tracking-tight text-neutral-900 sm:text-5xl">
+              Classify cats and dogs
+              <br className="hidden sm:block" />{" "}
+              <span className="text-brand">from any photo.</span>
             </h1>
-            <p className="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-neutral-600 sm:text-base">
-              Upload an image and PawDetect will tell you if it&apos;s a dog, a cat, or
-              something else — running entirely in your browser.
+            <p className="mx-auto mt-4 max-w-xl text-sm leading-relaxed text-neutral-600 sm:text-base">
+              Upload an image and PawDetect will tell you if it&apos;s a dog, a cat,
+              or something else — running entirely in your browser.
             </p>
           </div>
 
           <div
-            className="mt-10 space-y-6 animate-fade-in-up"
+            className="mt-12 space-y-6 animate-fade-in-up"
             style={{ animationDelay: "80ms" }}
           >
             <ImageUploader disabled={disabled} onFileSelected={handleFile} />
 
             {previewUrl ? (
-              <div className="animate-scale-in overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-sm">
+              <div className="animate-scale-in overflow-hidden rounded-2xl border border-neutral-200/60 bg-white shadow-elev">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={previewUrl}
@@ -151,7 +163,7 @@ export default function PawDetectShell() {
               type="button"
               onClick={handlePredict}
               disabled={!previewUrl || disabled}
-              className="group inline-flex w-full items-center justify-center gap-2 rounded-xl bg-neutral-900 px-4 py-3 text-sm font-semibold text-white transition-all duration-300 hover:-translate-y-0.5 hover:bg-brand hover:shadow-md disabled:cursor-not-allowed disabled:translate-y-0 disabled:bg-neutral-300 disabled:shadow-none"
+              className="group inline-flex w-full items-center justify-center gap-2 rounded-xl bg-neutral-900 px-4 py-3.5 text-sm font-semibold text-white shadow-elev transition-all duration-300 hover:-translate-y-0.5 hover:bg-brand hover:shadow-lg disabled:cursor-not-allowed disabled:translate-y-0 disabled:bg-neutral-300 disabled:shadow-none"
             >
               {predicting
                 ? "Analyzing…"

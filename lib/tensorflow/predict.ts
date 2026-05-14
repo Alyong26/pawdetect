@@ -25,22 +25,43 @@ export type PredictionOutput = {
 };
 
 /**
- * Binary-head margin floor. Even when MobileNet says "this is a pet",
- * we still require the cat-vs-dog head to commit with at least this much
- * probability. Below the floor we fall back to "Not a Dog or Cat" to avoid
- * coin-flip predictions like "Dog, 52%".
+ * If MobileNet's combined dog + cat probability mass is ≥ this, we treat the
+ * photo as definitely a pet and let the binary head pick the label.
  */
-const BINARY_CONFIDENCE_FLOOR = 0.6;
+const PET_SCORE_STRICT = 0.18;
 
 /**
- * Top-level classifier. Order of operations:
- *   1. Run MobileNet ImageNet on the decoded image to compute dog / cat
- *      probability mass (the OOD gate). This is what rejects cars, food,
- *      landscapes, etc.
- *   2. If the gate says "pet", run the binary cat-vs-dog head with TTA and
- *      use its (calibrated) sigmoid for the final label and confidence.
- *   3. If the binary head is on the fence (max prob < BINARY_CONFIDENCE_FLOOR),
- *      we still report Unknown for safety.
+ * Below this score the photo has essentially no ImageNet pet signal across
+ * either the full-frame or the center-crop pass — reject without consulting
+ * the binary head (it has no training-data support for this image).
+ */
+const PET_SCORE_FLOOR = 0.025;
+
+/**
+ * Between FLOOR and STRICT we let the binary head act as a tiebreaker. If it
+ * commits with at least this much probability we accept the photo. This is
+ * what rescues real pet photos where MobileNet is distracted by the framing
+ * (selfies, occlusion, multi-subject, busy backgrounds).
+ */
+const BORDERLINE_BINARY_FLOOR = 0.7;
+
+/**
+ * Even on strong MobileNet signal, refuse to commit if the binary head is in
+ * the 50–60% coin-flip zone.
+ */
+const BINARY_CONFIDENCE_FLOOR = 0.55;
+
+/**
+ * Top-level classifier.
+ *
+ * Flow:
+ *   1. MobileNet OOD pass (`detectPet`) computes petScore from full + crop.
+ *   2. petScore < FLOOR → Unknown (clearly not a pet).
+ *   3. Otherwise run the binary cat-vs-dog head with horizontal-flip TTA.
+ *   4. If petScore is strong (≥ STRICT) OR borderline but binary head agrees
+ *      strongly (≥ BORDERLINE_BINARY_FLOOR), accept the binary head's pick.
+ *   5. If the binary head is on the fence (< BINARY_CONFIDENCE_FLOOR), return
+ *      Unknown for safety.
  */
 export async function runPrediction(
   model: tf.LayersModel,
@@ -49,28 +70,45 @@ export async function runPrediction(
 ): Promise<PredictionOutput> {
   const petDetector = await detectPet(image);
 
-  const noBinary = {
-    rawSigmoid: 0,
-    dogProbability: petDetector.dogScore,
-    catProbability: petDetector.catScore,
-  };
-
-  if (petDetector.kind === "neither") {
-    // Show how confident we are that this is NOT a pet.
-    const notPetConfidence = clamp01(1 - petDetector.petScore);
-    return {
-      ...noBinary,
-      label: "Not a Dog or Cat",
-      confidencePercent: toPercent(notPetConfidence),
-      isUnknown: true,
-      unknownReason: "ood",
-      petDetector,
-    };
+  if (petDetector.petScore < PET_SCORE_FLOOR) {
+    return makeUnknown(petDetector, "ood");
   }
 
-  // OOD gate accepted — run the binary head for the final cat-vs-dog call.
+  const binary = await runBinaryHead(model, image, options?.tta);
+  const topProb = Math.max(binary.dogProbability, binary.catProbability);
+  const binaryLabel: "Dog" | "Cat" =
+    binary.dogProbability >= 0.5 ? "Dog" : "Cat";
+
+  const strongPetSignal = petDetector.petScore >= PET_SCORE_STRICT;
+  const borderlineButBinaryConfident =
+    petDetector.petScore >= PET_SCORE_FLOOR && topProb >= BORDERLINE_BINARY_FLOOR;
+
+  if (!strongPetSignal && !borderlineButBinaryConfident) {
+    return makeUnknown(petDetector, "ood", binary);
+  }
+
+  if (topProb < BINARY_CONFIDENCE_FLOOR) {
+    return makeUnknown(petDetector, "low-confidence", binary);
+  }
+
+  return {
+    label: binaryLabel,
+    rawSigmoid: binary.rawSigmoid,
+    dogProbability: binary.dogProbability,
+    catProbability: binary.catProbability,
+    confidencePercent: toPercent(topProb),
+    isUnknown: false,
+    petDetector,
+  };
+}
+
+async function runBinaryHead(
+  model: tf.LayersModel,
+  image: DecodedImageSource,
+  tta?: boolean,
+): Promise<{ rawSigmoid: number; dogProbability: number; catProbability: number }> {
   const input = preprocessImageElement(image);
-  const useTta = options?.tta !== false;
+  const useTta = tta !== false;
 
   const sigmoid = useTta
     ? tf.tidy(() => {
@@ -89,29 +127,26 @@ export async function runPrediction(
   sigmoid.dispose();
   input.dispose();
 
-  const topProb = Math.max(dogProbability, catProbability);
-  const petLabel: "Dog" | "Cat" = dogProbability >= 0.5 ? "Dog" : "Cat";
+  return { rawSigmoid, dogProbability, catProbability };
+}
 
-  if (topProb < BINARY_CONFIDENCE_FLOOR) {
-    return {
-      rawSigmoid,
-      dogProbability,
-      catProbability,
-      label: "Not a Dog or Cat",
-      confidencePercent: toPercent(clamp01(1 - petDetector.petScore)),
-      isUnknown: true,
-      unknownReason: "low-confidence",
-      petDetector,
-    };
-  }
-
+function makeUnknown(
+  petDetector: PetDetectionResult,
+  reason: "ood" | "low-confidence",
+  binary?: { rawSigmoid: number; dogProbability: number; catProbability: number },
+): PredictionOutput {
+  // Confidence shown to the user expresses how confident we are this is NOT a
+  // pet. Use the OOD signal as the primary source; fall back to binary head
+  // margin when we have it.
+  const notPetConfidence = clamp01(1 - petDetector.petScore);
   return {
-    rawSigmoid,
-    dogProbability,
-    catProbability,
-    label: petLabel,
-    confidencePercent: toPercent(topProb),
-    isUnknown: false,
+    label: "Not a Dog or Cat",
+    rawSigmoid: binary?.rawSigmoid ?? 0,
+    dogProbability: binary?.dogProbability ?? petDetector.dogScore,
+    catProbability: binary?.catProbability ?? petDetector.catScore,
+    confidencePercent: toPercent(notPetConfidence),
+    isUnknown: true,
+    unknownReason: reason,
     petDetector,
   };
 }

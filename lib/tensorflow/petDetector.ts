@@ -1,19 +1,23 @@
 /**
  * OOD (out-of-distribution) pet detector built on top of MobileNet ImageNet.
  *
- * The binary cat-vs-dog head we ship in `public/model/` has never seen images
- * that are neither cats nor dogs. Even with a probability margin threshold it
- * can return Dog or Cat with very high confidence on an unrelated photo
- * (a car, a flower, a landscape, …). Thresholding sigmoid is not enough.
+ * The binary cat-vs-dog head in `public/model/` was trained only on cats and
+ * dogs. Even with a sigmoid margin threshold it can confidently misclassify
+ * unrelated photos. To gate it reliably we run MobileNet (1k ImageNet classes)
+ * and check the probability mass on the 118 dog classes (indices 151–268) and
+ * the 5 cat classes (indices 281–285).
  *
- * To gate the binary head reliably, we run MobileNet (ImageNet, 1k classes)
- * first and check whether any dog-breed class (indices 151–268) or cat class
- * (indices 281–285) carries non-trivial mass. If neither does, the photo is
- * almost certainly not a cat or dog and we short-circuit to "Not a Dog or Cat".
+ * Two MobileNet passes are performed for every photo:
+ *   1. The full frame.
+ *   2. A centered ~70% crop.
  *
- * MobileNet v2 with alpha 0.5 keeps the model footprint small (~5 MB) and is
- * lazy-loaded only the first time a user clicks Classify, so the initial page
- * load stays snappy.
+ * The crop pass exists for partial-occlusion / multi-subject shots — selfies
+ * with a pet, group photos, photos where the cat is centered but framed by
+ * lots of background, etc. Whichever pass scores higher on the pet classes
+ * is the one that drives the verdict.
+ *
+ * The final accept / reject decision happens in `predict.ts` so we can also
+ * weigh in the binary head's confidence as a tiebreaker.
  */
 import "@tensorflow/tfjs"; // ensure tfjs core is initialised before mobilenet
 import type { MobileNet } from "@tensorflow-models/mobilenet";
@@ -24,30 +28,18 @@ const DOG_CLASS_MAX = 268;
 /** ImageNet class indices for cat classes (tabby … Egyptian cat). */
 const CAT_CLASS_INDICES = [281, 282, 283, 284, 285] as const;
 
-/**
- * Minimum combined dog+cat probability needed to even consider running the
- * binary head. Below this the prediction is reported as "Not a Dog or Cat".
- * Empirically:
- *   - Clear pet photos: petScore is usually 0.4–0.95.
- *   - Random non-pet photos (cars, landscapes, people, food …): petScore < 0.05.
- *   - Borderline animals (wolves, foxes, tigers): petScore is in the 0.05–0.15 range.
- *
- * 0.12 keeps the gate strict without rejecting unusual angles or
- * indoor lighting of real pets.
- */
-const PET_SCORE_THRESHOLD = 0.12;
-
 export type PetDetectionKind = "dog" | "cat" | "neither";
 
 export type PetDetectionResult = {
+  /** Coarse verdict — "neither" iff both crop and full frame agree there is no pet. */
   kind: PetDetectionKind;
-  /** Probability mass assigned to ImageNet dog classes. */
+  /** Probability mass assigned to ImageNet dog classes (max over passes). */
   dogScore: number;
-  /** Probability mass assigned to ImageNet cat classes. */
+  /** Probability mass assigned to ImageNet cat classes (max over passes). */
   catScore: number;
-  /** dogScore + catScore. */
+  /** dogScore + catScore — primary "is this a pet" signal. */
   petScore: number;
-  /** Best top-1 ImageNet label, for diagnostics. */
+  /** Best top-1 ImageNet label across passes. */
   topLabel: string;
   /** Probability of the top-1 label. */
   topProb: number;
@@ -64,7 +56,6 @@ export async function loadPetDetector(): Promise<MobileNet> {
       // accurate for the cat / dog gate we need.
       return mobilenet.load({ version: 2, alpha: 0.5 });
     })().catch((error) => {
-      // Reset so the next call re-attempts; otherwise we cache the failure.
       mobilenetPromise = null;
       throw error;
     });
@@ -72,24 +63,62 @@ export async function loadPetDetector(): Promise<MobileNet> {
   return mobilenetPromise;
 }
 
+type PassScores = {
+  dogScore: number;
+  catScore: number;
+  topLabel: string;
+  topProb: number;
+};
+
 /**
- * Runs MobileNet on the supplied image and returns the dog/cat probability
- * masses plus a verdict. The image is classified at native resolution.
+ * Runs MobileNet on the full image AND on a centered crop, returning the
+ * stronger signal. The orchestrator in `predict.ts` is responsible for the
+ * final accept / reject decision.
  */
 export async function detectPet(
   image: HTMLImageElement | ImageBitmap | HTMLCanvasElement | HTMLVideoElement,
 ): Promise<PetDetectionResult> {
   const model = await loadPetDetector();
-  // mobilenet's TS types do not include ImageBitmap; paint it onto a canvas
-  // when needed so the same code path works for HTMLImageElement and Bitmap.
   const renderable = toRenderable(image);
-  const predictions = await model.classify(renderable, 50);
 
-  let dogScore = 0;
-  let catScore = 0;
+  const fullScores = await scoreImage(model, renderable);
+
+  // Center crop pass: pets are often centered even when something else fills
+  // the rest of the frame (a hand, hair, another person, background clutter).
+  // Cropping to ~70% biases the classifier toward the central subject.
+  const crop = centerCropToCanvas(renderable, 0.7);
+  const cropScores = crop ? await scoreImage(model, crop) : null;
+
+  const dogScore = Math.max(fullScores.dogScore, cropScores?.dogScore ?? 0);
+  const catScore = Math.max(fullScores.catScore, cropScores?.catScore ?? 0);
+  const petScore = dogScore + catScore;
+
+  // Use whichever pass had the higher combined pet signal as the source of
+  // the diagnostic top-label.
+  const fullPet = fullScores.dogScore + fullScores.catScore;
+  const cropPet = (cropScores?.dogScore ?? 0) + (cropScores?.catScore ?? 0);
+  const top = cropPet > fullPet && cropScores ? cropScores : fullScores;
+
+  const kind: PetDetectionKind =
+    petScore <= 0 ? "neither" : dogScore >= catScore ? "dog" : "cat";
+
+  return {
+    kind,
+    dogScore,
+    catScore,
+    petScore,
+    topLabel: top.topLabel,
+    topProb: top.topProb,
+  };
+}
+
+async function scoreImage(
+  model: MobileNet,
+  renderable: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
+): Promise<PassScores> {
+  const predictions = await model.classify(renderable, 5);
   let topLabel = "";
   let topProb = 0;
-
   for (const p of predictions) {
     if (p.probability > topProb) {
       topProb = p.probability;
@@ -97,24 +126,18 @@ export async function detectPet(
     }
   }
 
-  // The npm package only returns top-K class names + probabilities, not the
-  // raw 1000-way distribution. To compute exact index-range sums we need the
-  // raw tensor — use model.infer() and slice the relevant index ranges.
   const logits = model.infer(renderable, false) as import("@tensorflow/tfjs").Tensor;
+  let dogScore = 0;
+  let catScore = 0;
   try {
     const squeezed = logits.squeeze();
     const size = squeezed.size;
-    // MobileNet v2 from tfjs-models emits [1, 1001]: index 0 is "background",
-    // indices 1..1000 map to ImageNet classes 0..999. Older v1 builds emit
-    // [1, 1000]. Strip the background slot when present so our index ranges
-    // line up with the canonical ImageNet ordering.
-    const aligned =
-      size === 1001 ? squeezed.slice([1], [1000]) : squeezed;
-
+    // MobileNet v2 from tfjs-models emits [1, 1001] (background + 1k classes).
+    // v1 emits [1, 1000]. Drop the background slot when present so our index
+    // ranges line up with the canonical ImageNet ordering.
+    const aligned = size === 1001 ? squeezed.slice([1], [1000]) : squeezed;
     const probs = (await aligned.data()) as Float32Array;
 
-    // Some MobileNet variants emit logits, others emit post-softmax probs.
-    // Detect by summing — if total ≈ 1 it is already probabilities.
     let total = 0;
     for (let i = 0; i < probs.length; i += 1) total += probs[i];
     const isAlreadyProbs = Math.abs(total - 1) < 0.05;
@@ -133,16 +156,7 @@ export async function detectPet(
     logits.dispose();
   }
 
-  const petScore = dogScore + catScore;
-
-  let kind: PetDetectionKind;
-  if (petScore < PET_SCORE_THRESHOLD) {
-    kind = "neither";
-  } else {
-    kind = dogScore >= catScore ? "dog" : "cat";
-  }
-
-  return { kind, dogScore, catScore, petScore, topLabel, topProb };
+  return { dogScore, catScore, topLabel, topProb };
 }
 
 function toRenderable(
@@ -160,6 +174,37 @@ function toRenderable(
   const ctx = canvas.getContext("2d");
   if (ctx) ctx.drawImage(bitmap, 0, 0);
   return canvas;
+}
+
+function centerCropToCanvas(
+  image: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
+  ratio: number,
+): HTMLCanvasElement | null {
+  const { width, height } = naturalSize(image);
+  if (width < 32 || height < 32) return null;
+  const minDim = Math.min(width, height);
+  const cropSize = Math.max(16, Math.floor(minDim * ratio));
+  const sx = Math.floor((width - cropSize) / 2);
+  const sy = Math.floor((height - cropSize) / 2);
+  const canvas = document.createElement("canvas");
+  canvas.width = cropSize;
+  canvas.height = cropSize;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return null;
+  ctx.drawImage(image, sx, sy, cropSize, cropSize, 0, 0, cropSize, cropSize);
+  return canvas;
+}
+
+function naturalSize(
+  image: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
+): { width: number; height: number } {
+  if (image instanceof HTMLImageElement) {
+    return { width: image.naturalWidth, height: image.naturalHeight };
+  }
+  if (image instanceof HTMLVideoElement) {
+    return { width: image.videoWidth, height: image.videoHeight };
+  }
+  return { width: image.width, height: image.height };
 }
 
 function softmax(values: Float32Array): Float32Array {
