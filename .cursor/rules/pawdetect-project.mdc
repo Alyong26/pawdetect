@@ -1,0 +1,14 @@
+---
+description: PawDetect project context (aligned with README.md)
+alwaysApply: true
+---
+
+# PawDetect — project context
+
+- **What it is:** Next.js 15 PWA; cat/dog classification **in the browser** with TensorFlow.js. No DB, no auth, static deploy (e.g. Vercel).
+- **Model assets:** `public/model/` must include `model.json`, `group1-shard.bin`, and **`infer.json`** (`kerasClassIndexFoldersAlphabetical`, `pixelNorm`). MobileNet training → `pixelNorm: mobilenet_v2`; scratch CNN → `div255`. Loader may align `pixelNorm` with topology.
+- **Training:** Prefer **`colab/pawdetect_colab_train.py`** on Colab GPU. Env vars: `PAWDETECT_DATA`, `PAWDETECT_ARCH` (`mobilenet` default vs `scratch`), `PAWDETECT_EPOCHS`, `PAWDETECT_BATCH`, `PAWDETECT_LR`, `PAWDETECT_VAL_SPLIT`. Export zip → unzip into `public/model/` (overwrite all three assets). Script merges shards and patches Keras 3 JSON for tfjs.
+- **Inference pipeline:** `lib/tensorflow/loadModel.ts` (Keras 3 → tfjs JSON patches, Cache Storage for weights, `tf.loadLayersModel`), `preprocess.ts` (224×224 bilinear, `infer.json` norm), `predict.ts` (TTA default). Images: `decodeImageForModel` in `lib/imageUtils.ts` (EXIF via `createImageBitmap` when supported).
+- **Dev / cache:** `npm run dev`; if model or chunks act stale, `npm run clean` then dev, or hard refresh; DevTools “Disable cache” forces re-fetch. PWA SW is off in dev; use `npm run build && npm start` to test SW.
+- **Scripts:** `npm run clean`, `npm run dev:clean`, `npm run build`, `npm run train:model`, `npm run export:model`, `npm run icons`.
+- **Full detail:** See repository **`README.md`** (source of truth for setup, Colab steps, deploy, and folder layout).

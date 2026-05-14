@@ -1,0 +1,7 @@
+{
+  "kerasClassIndexFoldersAlphabetical": [
+    "cats",
+    "dogs"
+  ],
+  "pixelNorm": "mobilenet_v2"
+}
