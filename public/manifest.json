@@ -1,12 +1,12 @@
 {
-  "name": "PawDetect — Cat & Dog CNN",
+  "name": "PawDetect",
   "short_name": "PawDetect",
-  "description": "Classify cat and dog photos locally with TensorFlow.js.",
+  "description": "Classify cats and dogs from any photo, in your browser.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#f8fafc",
-  "theme_color": "#0ea5e9",
+  "background_color": "#ffffff",
+  "theme_color": "#1e2a78",
   "lang": "en",
   "icons": [
     {

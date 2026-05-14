@@ -17,10 +17,6 @@ export const metadata: Metadata = {
     "Classify cats and dogs from any photo, in your browser.",
   applicationName: "PawDetect",
   manifest: "/manifest.json",
-  icons: {
-    icon: [{ url: "/icons/icon-192.png", sizes: "192x192", type: "image/png" }],
-    apple: [{ url: "/icons/icon-192.png", sizes: "192x192" }],
-  },
   appleWebApp: {
     capable: true,
     statusBarStyle: "default",

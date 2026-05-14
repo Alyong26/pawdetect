@@ -1,22 +1,24 @@
 import Image from "next/image";
+import Link from "next/link";
 
 export function Header() {
   return (
     <header className="border-b border-neutral-200 bg-white">
-      <div className="mx-auto flex max-w-3xl items-center gap-3 px-4 py-4 sm:px-6">
-        <div className="relative h-8 w-8 overflow-hidden rounded-lg">
+      <div className="mx-auto flex max-w-3xl items-center px-4 py-4 sm:px-6">
+        <Link
+          href="/"
+          aria-label="PawDetect home"
+          className="inline-flex items-center"
+        >
           <Image
-            src="/icons/icon-192.png"
+            src="/brand/pawdetect-logo.png"
             alt="PawDetect"
-            fill
-            sizes="32px"
-            className="object-cover"
+            width={160}
+            height={48}
             priority
+            className="h-10 w-auto"
           />
-        </div>
-        <span className="text-base font-semibold tracking-tight text-neutral-900">
-          PawDetect
-        </span>
+        </Link>
       </div>
     </header>
   );
