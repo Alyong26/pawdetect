@@ -9,19 +9,21 @@ PawDetect is a Progressive Web App that runs a MobileNetV2-based image classifie
 ## What it does
 
 - Accepts a JPEG, PNG, WebP, or GIF image from your device.
-- Resizes to 224×224, normalizes with MobileNet V2 preprocessing, and runs a sigmoid head with horizontal-flip test-time augmentation.
-- Returns **Dog** or **Cat** when confidence is at least 70%; otherwise returns **Not a Dog or Cat**.
+- Runs a two-stage classifier in the browser and returns **Dog**, **Cat**, or **Not a Dog or Cat**.
 - Installable as a PWA on supported browsers.
 
 ## How it works
 
+The pipeline combines the project's **trained binary cat-vs-dog head** with a generic **MobileNet ImageNet** model for out-of-distribution rejection and as a confidence-aware tiebreaker.
+
 | Stage | Detail |
 |-------|--------|
-| Model | MobileNetV2 (ImageNet) + GAP + Dropout + sigmoid head, trained on a cats-vs-dogs dataset. |
+| Trained binary head | MobileNetV2 (ImageNet) + GAP + Dropout + sigmoid, fine-tuned on a cats-vs-dogs dataset. Lives in `public/model/`. |
 | Runtime | TensorFlow.js with WebGL backend (falls back to CPU). |
-| Preprocessing | 224×224 bilinear resize, MobileNet V2 normalization (`pixel/127.5 - 1`). |
-| Inference | Two forward passes (original + horizontal flip), averaged. |
-| Unknown class | If the higher of P(dog) or P(cat) is below 70%, the result is **Not a Dog or Cat**. |
+| Preprocessing | 224×224 bilinear resize, MobileNet V2 normalization (`pixel/127.5 − 1`). |
+| OOD gate | MobileNet v2 alpha 0.5 (ImageNet, 1k classes) runs on the full image **and** a centered 70% crop. We sum probability mass on the 118 ImageNet dog classes (indices 151–268) and 5 cat classes (281–285). Below a small floor the photo is rejected as **Not a Dog or Cat**. |
+| Binary inference | Two forward passes through the trained head (original + horizontal flip), averaged. |
+| Ensemble | The trained head's `P(Dog)` is combined with MobileNet's dog-vs-cat ratio using confidence-adaptive weights: when the trained head is confident, its weight is up to 0.8; when it is near the decision boundary, MobileNet rises to 0.6 as a tiebreaker. This preserves the trained model as the primary classifier while preventing visibly wrong labels on borderline cases. |
 | Privacy | Everything happens in the browser. Images never leave the device. |
 
 ## Run locally
@@ -49,12 +51,14 @@ npm start
 ## Project structure
 
 ```
-app/                     Next.js App Router (layout, page, client shell loader)
-components/              UI components (Header, Footer, ImageUploader, PredictionCard, ...)
-lib/tensorflow/          loadModel, preprocess, predict, infer config
-public/model/            model.json, group1-shard.bin, infer.json
+app/                     Next.js App Router (layout, page, client shell loader, icon assets)
+components/              UI components (Header, Footer, ImageUploader, BrandLoader, LoadingSpinner, PredictionCard, PawDetectShell)
+lib/tensorflow/          loadModel, preprocess, predict, petDetector (OOD gate), inferConfig
+public/model/            model.json, group1-shard.bin, infer.json (the trained binary head)
+public/brand/            Canonical brand logo (source of truth for every icon size)
+public/icons/            PWA icons generated from the brand logo
 colab/                   Colab training script for retraining MobileNetV2
-scripts/                 Maintenance scripts (clean .next, generate icons, test loader)
+scripts/                 Maintenance scripts (clean .next, generate icons, train/export)
 ```
 
 ## Replacing the model
