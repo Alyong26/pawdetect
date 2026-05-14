@@ -9,15 +9,18 @@
  * register somewhere. The orchestrator in `predict.ts` uses the strongest
  * region for MobileNet dog/cat *split* and can ensemble the binary head
  * across several crops.
+ *
+ * We use v2 alpha 1.0 (~14 MB, cached by the PWA service worker) instead of
+ * the smaller alpha 0.5. The smaller model was confusing black cats with
+ * dark-furred dog breeds (schipperke, black Labrador, Scottish terrier),
+ * which left the disagreement resolver in `predict.ts` unable to fire.
+ *
+ * Scoring matches the canonical ImageNet label strings that `classify()`
+ * returns, instead of summing tensor indices directly — this is robust to
+ * the "background class" offset that the v2 model checkpoint includes.
  */
 import "@tensorflow/tfjs";
 import type { MobileNet } from "@tensorflow-models/mobilenet";
-
-/** ImageNet class index range for dog breeds (Chihuahua … Mexican hairless). */
-const DOG_CLASS_MIN = 151;
-const DOG_CLASS_MAX = 268;
-/** ImageNet class indices for cat classes (tabby … Egyptian cat). */
-const CAT_CLASS_INDICES = [281, 282, 283, 284, 285] as const;
 
 export type PetDetectionKind = "dog" | "cat" | "neither";
 
@@ -54,12 +57,14 @@ export type PetDetectionResult = {
 
 let mobilenetPromise: Promise<MobileNet> | null = null;
 
-/** Loads MobileNet v2 (alpha 0.5) once and caches the promise. */
+/** Loads MobileNet v2 (alpha 1.0) once and caches the promise. */
 export async function loadPetDetector(): Promise<MobileNet> {
   if (!mobilenetPromise) {
     mobilenetPromise = (async () => {
       const mobilenet = await import("@tensorflow-models/mobilenet");
-      return mobilenet.load({ version: 2, alpha: 0.5 });
+      // v2 alpha 1.0 224 — 3.4M params, ~14 MB. The PWA SW caches the weights
+      // after first load, so it's a one-time download per user.
+      return mobilenet.load({ version: 2, alpha: 1.0 });
     })().catch((error) => {
       mobilenetPromise = null;
       throw error;
@@ -158,45 +163,35 @@ function buildRegions(image: Renderable): Region[] {
   return regions;
 }
 
+/**
+ * Score a single region by asking MobileNet for the full sorted distribution,
+ * then summing the probability mass for the 5 cat classes (anything whose
+ * label contains "cat" as a whole word) and the 118 canonical ImageNet dog
+ * breed labels. Label matching is robust to the background-class offset that
+ * v2 model checkpoints include.
+ */
 async function scoreImage(
   model: MobileNet,
   renderable: Renderable,
 ): Promise<PassScores> {
-  const predictions = await model.classify(renderable, 5);
+  const predictions = await model.classify(renderable, 1000);
+
+  let dogScore = 0;
+  let catScore = 0;
   let topLabel = "";
   let topProb = 0;
+
   for (const p of predictions) {
     if (p.probability > topProb) {
       topProb = p.probability;
       topLabel = p.className;
     }
-  }
-
-  const logits = model.infer(renderable, false) as import("@tensorflow/tfjs").Tensor;
-  let dogScore = 0;
-  let catScore = 0;
-  try {
-    const squeezed = logits.squeeze();
-    const size = squeezed.size;
-    const aligned = size === 1001 ? squeezed.slice([1], [1000]) : squeezed;
-    const probs = (await aligned.data()) as Float32Array;
-
-    let total = 0;
-    for (let i = 0; i < probs.length; i += 1) total += probs[i];
-    const isAlreadyProbs = Math.abs(total - 1) < 0.05;
-    const probArray = isAlreadyProbs ? probs : softmax(probs);
-
-    for (let i = DOG_CLASS_MIN; i <= DOG_CLASS_MAX; i += 1) {
-      dogScore += probArray[i] ?? 0;
+    const lower = p.className.toLowerCase();
+    if (CAT_LABEL_REGEX.test(lower)) {
+      catScore += p.probability;
+    } else if (IMAGENET_DOG_LABELS.has(lower)) {
+      dogScore += p.probability;
     }
-    for (const i of CAT_CLASS_INDICES) {
-      catScore += probArray[i] ?? 0;
-    }
-
-    if (aligned !== squeezed) aligned.dispose();
-    squeezed.dispose();
-  } finally {
-    logits.dispose();
   }
 
   return { dogScore, catScore, topLabel, topProb };
@@ -251,19 +246,139 @@ function naturalSize(image: Renderable): { width: number; height: number } {
   return { width: image.width, height: image.height };
 }
 
-function softmax(values: Float32Array): Float32Array {
-  let max = -Infinity;
-  for (let i = 0; i < values.length; i += 1) {
-    if (values[i] > max) max = values[i];
-  }
-  const out = new Float32Array(values.length);
-  let sum = 0;
-  for (let i = 0; i < values.length; i += 1) {
-    out[i] = Math.exp(values[i] - max);
-    sum += out[i];
-  }
-  for (let i = 0; i < values.length; i += 1) {
-    out[i] /= sum;
-  }
-  return out;
-}
+/**
+ * Word-boundary match for "cat" — catches the 5 ImageNet cat classes
+ * ("tabby, tabby cat", "tiger cat", "Persian cat", "Siamese cat, Siamese",
+ * "Egyptian cat") without false-matching "catamaran" (472) or "catfish" (470).
+ */
+const CAT_LABEL_REGEX = /\bcat\b/i;
+
+/**
+ * Canonical ImageNet labels for the 118 dog classes (indices 151–268),
+ * lowercased to match `MobileNet.classify()` output after we lowercase it.
+ *
+ * Intentionally excludes wolves / foxes / hyenas (269–280) and big cats
+ * (286–293 — cougar / lynx / leopard / lion / tiger / cheetah etc.), so a
+ * lion or wolf photo reports "Not a Dog or Cat", which is what users want
+ * from a domestic-pet classifier.
+ */
+const IMAGENET_DOG_LABELS = new Set<string>([
+  "chihuahua",
+  "japanese spaniel",
+  "maltese dog, maltese terrier, maltese",
+  "pekinese, pekingese, peke",
+  "shih-tzu",
+  "blenheim spaniel",
+  "papillon",
+  "toy terrier",
+  "rhodesian ridgeback",
+  "afghan hound, afghan",
+  "basset, basset hound",
+  "beagle",
+  "bloodhound, sleuthhound",
+  "bluetick",
+  "black-and-tan coonhound",
+  "walker hound, walker foxhound",
+  "english foxhound",
+  "redbone",
+  "borzoi, russian wolfhound",
+  "irish wolfhound",
+  "italian greyhound",
+  "whippet",
+  "ibizan hound, ibizan podenco",
+  "norwegian elkhound, elkhound",
+  "otterhound, otter hound",
+  "saluki, gazelle hound",
+  "scottish deerhound, deerhound",
+  "weimaraner",
+  "staffordshire bullterrier, staffordshire bull terrier",
+  "american staffordshire terrier, staffordshire terrier, american pit bull terrier, pit bull terrier",
+  "bedlington terrier",
+  "border terrier",
+  "kerry blue terrier",
+  "irish terrier",
+  "norfolk terrier",
+  "norwich terrier",
+  "yorkshire terrier",
+  "wire-haired fox terrier",
+  "lakeland terrier",
+  "sealyham terrier, sealyham",
+  "airedale, airedale terrier",
+  "cairn, cairn terrier",
+  "australian terrier",
+  "dandie dinmont, dandie dinmont terrier",
+  "boston bull, boston bulldog, boston terrier, boston bull terrier",
+  "miniature schnauzer",
+  "giant schnauzer",
+  "standard schnauzer",
+  "scotch terrier, scottish terrier, scottie",
+  "tibetan terrier, chrysanthemum dog",
+  "silky terrier, sydney silky",
+  "soft-coated wheaten terrier",
+  "west highland white terrier",
+  "lhasa, lhasa apso",
+  "flat-coated retriever",
+  "curly-coated retriever",
+  "golden retriever",
+  "labrador retriever",
+  "chesapeake bay retriever",
+  "german short-haired pointer",
+  "vizsla, hungarian pointer",
+  "english setter",
+  "irish setter, red setter",
+  "gordon setter",
+  "brittany spaniel",
+  "clumber, clumber spaniel",
+  "english springer, english springer spaniel",
+  "welsh springer spaniel",
+  "cocker spaniel, english cocker spaniel, cocker",
+  "sussex spaniel",
+  "irish water spaniel",
+  "kuvasz",
+  "schipperke",
+  "groenendael",
+  "malinois",
+  "briard",
+  "kelpie",
+  "komondor",
+  "old english sheepdog, bobtail",
+  "shetland sheepdog, shetland sheep dog, shetland",
+  "collie",
+  "border collie",
+  "bouvier des flandres, bouviers des flandres",
+  "rottweiler",
+  "german shepherd, german shepherd dog, german police dog, alsatian",
+  "doberman, doberman pinscher",
+  "miniature pinscher",
+  "greater swiss mountain dog",
+  "bernese mountain dog",
+  "appenzeller",
+  "entlebucher",
+  "boxer",
+  "bull mastiff",
+  "tibetan mastiff",
+  "french bulldog",
+  "great dane",
+  "saint bernard, st bernard",
+  "eskimo dog, husky",
+  "malamute, malemute, alaskan malamute",
+  "siberian husky",
+  "dalmatian, coach dog, carriage dog",
+  "affenpinscher, monkey pinscher, monkey dog",
+  "basenji",
+  "pug, pug-dog",
+  "leonberg",
+  "newfoundland, newfoundland dog",
+  "great pyrenees",
+  "samoyed, samoyede",
+  "pomeranian",
+  "chow, chow chow",
+  "keeshond",
+  "brabancon griffon",
+  "pembroke, pembroke welsh corgi",
+  "cardigan, cardigan welsh corgi",
+  "toy poodle",
+  "miniature poodle",
+  "standard poodle",
+  "mexican hairless",
+]);
