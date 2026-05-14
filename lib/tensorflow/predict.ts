@@ -1,7 +1,7 @@
 import * as tf from "@tensorflow/tfjs";
 import { rawSigmoidToDogProbability } from "./inferConfig";
-import { detectPet, type PetDetectionResult } from "./petDetector";
-import { preprocessImageElement, type DecodedImageSource } from "./preprocess";
+import { detectPet, type PetDetectionResult, type Renderable } from "./petDetector";
+import { preprocessFromPixels, preprocessImageElement, type DecodedImageSource } from "./preprocess";
 
 export type ClassLabel = "Dog" | "Cat" | "Not a Dog or Cat";
 
@@ -18,58 +18,52 @@ export type PredictionOutput = {
   confidencePercent: number;
   /** True if the photo was classified as Not a Dog or Cat. */
   isUnknown: boolean;
-  /** Reason the photo was rejected (only set when isUnknown is true). */
+  /** Reason the photo was rejected. */
   unknownReason?: "ood" | "low-confidence";
   /** Raw OOD scores for diagnostics. */
   petDetector: PetDetectionResult;
 };
 
 /**
- * Combined dog + cat probability mass on ImageNet (across full frame + center
- * crop) needed for a photo to even qualify as a pet candidate.
+ * Combined dog + cat probability mass on ImageNet (across 6 regions) needed
+ * for a photo to qualify as a pet candidate.
  *
- * IMPORTANT: the trained binary head is intentionally NOT consulted for OOD.
- * A binary cat-vs-dog classifier cannot say "neither" — when shown a person,
- * a lion, food, or a car it must commit to one side and is empirically biased
- * toward Dog with very high probability. Using its confidence as a tiebreaker
- * for borderline OOD photos is what caused the previous false-positive wave
- * (people, a lion, cannabis buds → "Dog"). So the OOD gate is decided by
- * MobileNet alone.
+ * The trained binary head is intentionally NOT consulted for OOD because it
+ * has no notion of "neither" and is empirically biased toward Dog on non-pet
+ * inputs (people, lions, food, objects, etc.).
  */
-const PET_GATE = 0.15;
+const PET_GATE = 0.12;
 
 /**
- * After fusing MobileNet's dog/cat distribution with the binary head, the
- * winning class needs at least this fused probability for us to commit. This
- * catches the rare case where MobileNet and the trained head genuinely
- * disagree.
+ * After fusion, the winning class needs at least this much fused probability
+ * for us to commit. Otherwise we report Unknown for safety.
  */
 const FUSED_CONFIDENCE_FLOOR = 0.6;
 
 /**
- * Weight given to MobileNet (generalist; 118 dog breeds + 5 cat classes) when
- * fusing with the user's trained binary head (specialist).
+ * Weight of MobileNet (generalist) when fusing with the user-trained binary
+ * head (specialist).
  *
- * Both are kept in the loop:
- *   - MobileNet is the source of truth for "is this a pet, and broadly which".
- *   - The binary head adjusts the verdict based on whatever dataset-specific
- *     features it learned.
- *
- * 0.55 gives MobileNet a slight edge, which empirically corrects miscalls on
- * unusual breeds (e.g., a fluffy white Maltese the binary head was tilting
- * toward Cat).
+ * 0.45 / 0.55 favours the binary head slightly because it is specifically
+ * trained for cat-vs-dog discrimination — particularly useful now that we
+ * feed it the pet-dominated crop (not the full frame). MobileNet still gets
+ * close-to-equal weight so it can override the binary head on unusual breeds
+ * where the binary head wavers (e.g., fluffy white Maltese → cat 59%).
  */
-const MOBILENET_WEIGHT = 0.55;
+const MOBILENET_WEIGHT = 0.45;
 
 /**
  * Pipeline:
- *   1. MobileNet OOD pass (full frame + centered 70% crop, take max).
+ *   1. MobileNet OOD pass scans 6 regions (full, center, top, bottom, left,
+ *      right) and returns the region with the strongest pet signal.
  *   2. petScore < PET_GATE → Unknown. Binary head not invoked.
- *   3. Otherwise run the user-trained binary head with horizontal-flip TTA.
- *   4. Fuse MobileNet's normalised dog/cat split with the binary head's
- *      probabilities (weighted average, weights sum to 1).
+ *   3. Otherwise run the user-trained binary head with horizontal-flip TTA
+ *      on the BEST REGION — so it sees a pet-dominated patch instead of a
+ *      person-dominated full frame.
+ *   4. Fuse MobileNet's normalised dog/cat split (from the best region) with
+ *      the binary head's probabilities.
  *   5. If the winning fused probability is below FUSED_CONFIDENCE_FLOOR,
- *      report Unknown for safety; otherwise commit to Dog or Cat.
+ *      report Unknown; otherwise commit to Dog or Cat.
  */
 export async function runPrediction(
   model: tf.LayersModel,
@@ -82,10 +76,14 @@ export async function runPrediction(
     return makeUnknown(petDetector, "ood");
   }
 
-  const binary = await runBinaryHead(model, image, options?.tta);
+  // Run the trained binary head on the same region MobileNet identified as
+  // most pet-dominated. This is the key fix for the dark-kitten-with-person
+  // case: the binary head no longer has to fight with a dominant person in
+  // the frame.
+  const binary = await runBinaryHeadOnRegion(model, petDetector.bestRegion, options?.tta);
 
-  // Normalise MobileNet's dog/cat scores within the pet budget so they live on
-  // the same [0,1] scale as the binary head probabilities.
+  // Normalise MobileNet's dog/cat scores within the pet budget so they live
+  // on the same [0,1] scale as the binary head probabilities.
   const m = Math.max(petDetector.petScore, 1e-6);
   const dogM = petDetector.dogScore / m;
   const catM = petDetector.catScore / m;
@@ -113,12 +111,17 @@ export async function runPrediction(
   };
 }
 
-async function runBinaryHead(
+async function runBinaryHeadOnRegion(
   model: tf.LayersModel,
-  image: DecodedImageSource,
+  region: Renderable,
   tta?: boolean,
 ): Promise<{ rawSigmoid: number; dogProbability: number; catProbability: number }> {
-  const input = preprocessImageElement(image);
+  // preprocessFromPixels handles HTMLCanvasElement / HTMLImageElement /
+  // HTMLVideoElement via tf.browser.fromPixels.
+  const input =
+    region instanceof HTMLImageElement
+      ? preprocessImageElement(region)
+      : preprocessFromPixels(region as HTMLCanvasElement | HTMLVideoElement);
   const useTta = tta !== false;
 
   const sigmoid = useTta

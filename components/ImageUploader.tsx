@@ -57,9 +57,15 @@ export function ImageUploader({ disabled, onFileSelected }: Props) {
           <line x1="12" y1="3" x2="12" y2="15" />
         </svg>
       </div>
-      <p className="text-sm font-semibold text-neutral-900">Upload an image</p>
+      <p className="text-sm font-semibold text-neutral-900">
+        Upload a clear photo of a dog or cat
+      </p>
       <p className="mt-1 text-xs text-neutral-500">
         Drag and drop or click to choose · JPEG, PNG, WebP, GIF
+      </p>
+      <p className="mt-3 max-w-xs text-[11px] leading-relaxed text-neutral-400">
+        Tip: well-lit, close-up shots where the pet&apos;s face is visible give
+        the most accurate results.
       </p>
       <input
         id={inputId}

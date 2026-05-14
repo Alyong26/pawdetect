@@ -1,25 +1,22 @@
 /**
  * OOD (out-of-distribution) pet detector built on top of MobileNet ImageNet.
  *
- * The binary cat-vs-dog head in `public/model/` was trained only on cats and
- * dogs. Even with a sigmoid margin threshold it can confidently misclassify
- * unrelated photos. To gate it reliably we run MobileNet (1k ImageNet classes)
- * and check the probability mass on the 118 dog classes (indices 151–268) and
- * the 5 cat classes (indices 281–285).
+ * The binary cat-vs-dog head in `public/model/` only knows cats and dogs.
+ * Threshold its sigmoid all you want — it can still confidently misclassify a
+ * person, a lion, food, etc. So we gate with MobileNet (1k ImageNet classes)
+ * which DOES have a "neither" answer (anything outside the 118 dog + 5 cat
+ * indices).
  *
- * Two MobileNet passes are performed for every photo:
- *   1. The full frame.
- *   2. A centered ~70% crop.
- *
- * The crop pass exists for partial-occlusion / multi-subject shots — selfies
- * with a pet, group photos, photos where the cat is centered but framed by
- * lots of background, etc. Whichever pass scores higher on the pet classes
- * is the one that drives the verdict.
- *
- * The final accept / reject decision happens in `predict.ts` so we can also
- * weigh in the binary head's confidence as a tiebreaker.
+ * Multi-region scanning. A single center-crop pass misses pets that are:
+ *   - Off-center (cat to the side of a selfie)
+ *   - Held in the lower half of the frame
+ *   - Cropped at the top by a person above them
+ * So we scan 6 regions and report the strongest one. The orchestrator in
+ * `predict.ts` then feeds that exact region to the binary head, so the
+ * trained model sees a pet-dominated patch instead of a person-dominated
+ * full frame.
  */
-import "@tensorflow/tfjs"; // ensure tfjs core is initialised before mobilenet
+import "@tensorflow/tfjs";
 import type { MobileNet } from "@tensorflow-models/mobilenet";
 
 /** ImageNet class index range for dog breeds (Chihuahua … Mexican hairless). */
@@ -30,19 +27,32 @@ const CAT_CLASS_INDICES = [281, 282, 283, 284, 285] as const;
 
 export type PetDetectionKind = "dog" | "cat" | "neither";
 
+/** A renderable surface that tfjs / MobileNet / canvas can all consume. */
+export type Renderable =
+  | HTMLImageElement
+  | HTMLCanvasElement
+  | HTMLVideoElement;
+
 export type PetDetectionResult = {
-  /** Coarse verdict — "neither" iff both crop and full frame agree there is no pet. */
+  /** Coarse verdict — "neither" iff every region agreed there was no pet. */
   kind: PetDetectionKind;
-  /** Probability mass assigned to ImageNet dog classes (max over passes). */
+  /** Probability mass on ImageNet dog classes in the strongest region. */
   dogScore: number;
-  /** Probability mass assigned to ImageNet cat classes (max over passes). */
+  /** Probability mass on ImageNet cat classes in the strongest region. */
   catScore: number;
   /** dogScore + catScore — primary "is this a pet" signal. */
   petScore: number;
-  /** Best top-1 ImageNet label across passes. */
+  /** Best top-1 ImageNet label in the strongest region. */
   topLabel: string;
   /** Probability of the top-1 label. */
   topProb: number;
+  /**
+   * The region with the highest pet signal. Use this as the binary head's
+   * input so it sees a pet-dominated patch instead of the full frame.
+   */
+  bestRegion: Renderable;
+  /** Human-readable region tag for diagnostics. */
+  bestRegionName: string;
 };
 
 let mobilenetPromise: Promise<MobileNet> | null = null;
@@ -52,8 +62,6 @@ export async function loadPetDetector(): Promise<MobileNet> {
   if (!mobilenetPromise) {
     mobilenetPromise = (async () => {
       const mobilenet = await import("@tensorflow-models/mobilenet");
-      // version 2, alpha 0.5 is the lightest variant (~5 MB) — still very
-      // accurate for the cat / dog gate we need.
       return mobilenet.load({ version: 2, alpha: 0.5 });
     })().catch((error) => {
       mobilenetPromise = null;
@@ -70,34 +78,39 @@ type PassScores = {
   topProb: number;
 };
 
+type Region = {
+  name: string;
+  element: Renderable;
+};
+
 /**
- * Runs MobileNet on the full image AND on a centered crop, returning the
- * stronger signal. The orchestrator in `predict.ts` is responsible for the
- * final accept / reject decision.
+ * Scans the image at 6 regions (full frame, center, top, bottom, left, right)
+ * and returns the strongest pet signal along with the canvas of that region.
  */
 export async function detectPet(
   image: HTMLImageElement | ImageBitmap | HTMLCanvasElement | HTMLVideoElement,
 ): Promise<PetDetectionResult> {
   const model = await loadPetDetector();
-  const renderable = toRenderable(image);
+  const baseRenderable = toRenderable(image);
 
-  const fullScores = await scoreImage(model, renderable);
+  const regions = buildRegions(baseRenderable);
 
-  // Center crop pass: pets are often centered even when something else fills
-  // the rest of the frame (a hand, hair, another person, background clutter).
-  // Cropping to ~70% biases the classifier toward the central subject.
-  const crop = centerCropToCanvas(renderable, 0.7);
-  const cropScores = crop ? await scoreImage(model, crop) : null;
+  let best: { region: Region; scores: PassScores } | null = null;
 
-  const dogScore = Math.max(fullScores.dogScore, cropScores?.dogScore ?? 0);
-  const catScore = Math.max(fullScores.catScore, cropScores?.catScore ?? 0);
+  for (const region of regions) {
+    const scores = await scoreImage(model, region.element);
+    if (!best || scores.dogScore + scores.catScore > best.scores.dogScore + best.scores.catScore) {
+      best = { region, scores };
+    }
+  }
+
+  // regions[0] is always the full frame, so `best` is guaranteed non-null.
+  // Narrow for TS.
+  const { region: bestRegion, scores: bestScores } = best!;
+
+  const dogScore = bestScores.dogScore;
+  const catScore = bestScores.catScore;
   const petScore = dogScore + catScore;
-
-  // Use whichever pass had the higher combined pet signal as the source of
-  // the diagnostic top-label.
-  const fullPet = fullScores.dogScore + fullScores.catScore;
-  const cropPet = (cropScores?.dogScore ?? 0) + (cropScores?.catScore ?? 0);
-  const top = cropPet > fullPet && cropScores ? cropScores : fullScores;
 
   const kind: PetDetectionKind =
     petScore <= 0 ? "neither" : dogScore >= catScore ? "dog" : "cat";
@@ -107,14 +120,38 @@ export async function detectPet(
     dogScore,
     catScore,
     petScore,
-    topLabel: top.topLabel,
-    topProb: top.topProb,
+    topLabel: bestScores.topLabel,
+    topProb: bestScores.topProb,
+    bestRegion: bestRegion.element,
+    bestRegionName: bestRegion.name,
   };
+}
+
+function buildRegions(image: Renderable): Region[] {
+  const regions: Region[] = [{ name: "full", element: image }];
+  const tries: Array<{
+    name: string;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+  }> = [
+    { name: "center", x: 0.15, y: 0.15, w: 0.7, h: 0.7 },
+    { name: "top", x: 0, y: 0, w: 1, h: 0.7 },
+    { name: "bottom", x: 0, y: 0.3, w: 1, h: 0.7 },
+    { name: "left", x: 0, y: 0, w: 0.7, h: 1 },
+    { name: "right", x: 0.3, y: 0, w: 0.7, h: 1 },
+  ];
+  for (const t of tries) {
+    const canvas = regionCrop(image, t.x, t.y, t.w, t.h);
+    if (canvas) regions.push({ name: t.name, element: canvas });
+  }
+  return regions;
 }
 
 async function scoreImage(
   model: MobileNet,
-  renderable: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
+  renderable: Renderable,
 ): Promise<PassScores> {
   const predictions = await model.classify(renderable, 5);
   let topLabel = "";
@@ -132,9 +169,9 @@ async function scoreImage(
   try {
     const squeezed = logits.squeeze();
     const size = squeezed.size;
-    // MobileNet v2 from tfjs-models emits [1, 1001] (background + 1k classes).
-    // v1 emits [1, 1000]. Drop the background slot when present so our index
-    // ranges line up with the canonical ImageNet ordering.
+    // MobileNet v2 emits [1, 1001] (background + 1k); v1 emits [1, 1000].
+    // Strip the background slot when present so our index ranges line up
+    // with the canonical ImageNet ordering.
     const aligned = size === 1001 ? squeezed.slice([1], [1000]) : squeezed;
     const probs = (await aligned.data()) as Float32Array;
 
@@ -161,11 +198,11 @@ async function scoreImage(
 
 function toRenderable(
   image: HTMLImageElement | ImageBitmap | HTMLCanvasElement | HTMLVideoElement,
-): HTMLImageElement | HTMLCanvasElement | HTMLVideoElement {
+): Renderable {
   const isBitmap =
     typeof ImageBitmap !== "undefined" && image instanceof ImageBitmap;
   if (!isBitmap) {
-    return image as HTMLImageElement | HTMLCanvasElement | HTMLVideoElement;
+    return image as Renderable;
   }
   const bitmap = image as ImageBitmap;
   const canvas = document.createElement("canvas");
@@ -176,28 +213,29 @@ function toRenderable(
   return canvas;
 }
 
-function centerCropToCanvas(
-  image: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
-  ratio: number,
+function regionCrop(
+  image: Renderable,
+  xRatio: number,
+  yRatio: number,
+  wRatio: number,
+  hRatio: number,
 ): HTMLCanvasElement | null {
   const { width, height } = naturalSize(image);
   if (width < 32 || height < 32) return null;
-  const minDim = Math.min(width, height);
-  const cropSize = Math.max(16, Math.floor(minDim * ratio));
-  const sx = Math.floor((width - cropSize) / 2);
-  const sy = Math.floor((height - cropSize) / 2);
+  const w = Math.max(16, Math.floor(width * wRatio));
+  const h = Math.max(16, Math.floor(height * hRatio));
+  const x = Math.floor(width * xRatio);
+  const y = Math.floor(height * yRatio);
   const canvas = document.createElement("canvas");
-  canvas.width = cropSize;
-  canvas.height = cropSize;
+  canvas.width = w;
+  canvas.height = h;
   const ctx = canvas.getContext("2d");
   if (!ctx) return null;
-  ctx.drawImage(image, sx, sy, cropSize, cropSize, 0, 0, cropSize, cropSize);
+  ctx.drawImage(image, x, y, w, h, 0, 0, w, h);
   return canvas;
 }
 
-function naturalSize(
-  image: HTMLImageElement | HTMLCanvasElement | HTMLVideoElement,
-): { width: number; height: number } {
+function naturalSize(image: Renderable): { width: number; height: number } {
   if (image instanceof HTMLImageElement) {
     return { width: image.naturalWidth, height: image.naturalHeight };
   }
