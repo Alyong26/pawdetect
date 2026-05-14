@@ -3,4 +3,9 @@ export { preprocessImageElement, preprocessFromPixels, type DecodedImageSource }
 export { runPrediction } from "./predict";
 export type { PredictionOutput, ClassLabel } from "./predict";
 export { detectPet, loadPetDetector } from "./petDetector";
-export type { PetDetectionResult, PetDetectionKind, Renderable } from "./petDetector";
+export type {
+  PetDetectionResult,
+  PetDetectionKind,
+  Renderable,
+  RegionScore,
+} from "./petDetector";

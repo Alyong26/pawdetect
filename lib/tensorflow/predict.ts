@@ -1,70 +1,56 @@
 import * as tf from "@tensorflow/tfjs";
 import { rawSigmoidToDogProbability } from "./inferConfig";
-import { detectPet, type PetDetectionResult, type Renderable } from "./petDetector";
-import { preprocessFromPixels, preprocessImageElement, type DecodedImageSource } from "./preprocess";
+import {
+  detectPet,
+  type PetDetectionResult,
+  type Renderable,
+  type RegionScore,
+} from "./petDetector";
+import {
+  preprocessFromPixels,
+  preprocessImageElement,
+  type DecodedImageSource,
+} from "./preprocess";
 
 export type ClassLabel = "Dog" | "Cat" | "Not a Dog or Cat";
 
 export type PredictionOutput = {
   /** Final classification including the Unknown class. */
   label: ClassLabel;
-  /** Raw sigmoid from the trained binary head (≈ P(class 1)). 0 if not invoked. */
+  /** Raw sigmoid from the trained binary head on the primary crop (≈ P(class 1)). */
   rawSigmoid: number;
-  /** Final fused probability for Dog after combining MobileNet + binary head. */
+  /** Final probability for Dog after ensemble + fusion / overrides. */
   dogProbability: number;
-  /** Final fused probability for Cat after combining MobileNet + binary head. */
+  /** Final probability for Cat. */
   catProbability: number;
   /** Confidence for the displayed label, 0–100. */
   confidencePercent: number;
-  /** True if the photo was classified as Not a Dog or Cat. */
   isUnknown: boolean;
-  /** Reason the photo was rejected. */
   unknownReason?: "ood" | "low-confidence";
-  /** Raw OOD scores for diagnostics. */
   petDetector: PetDetectionResult;
 };
 
 /**
- * Combined dog + cat probability mass on ImageNet (across 6 regions) needed
- * for a photo to qualify as a pet candidate.
- *
- * The trained binary head is intentionally NOT consulted for OOD because it
- * has no notion of "neither" and is empirically biased toward Dog on non-pet
- * inputs (people, lions, food, objects, etc.).
+ * OOD gate on the strongest crop anywhere in the frame. Slightly below 0.12
+ * because we now add corner + tight-center crops that lift true pets without
+ * lifting random non-pet photos much (they stay near 0 everywhere).
  */
-const PET_GATE = 0.12;
+const PET_GATE = 0.09;
+
+const FUSED_CONFIDENCE_FLOOR = 0.58;
+
+const MOBILENET_WEIGHT = 0.42;
 
 /**
- * After fusion, the winning class needs at least this much fused probability
- * for us to commit. Otherwise we report Unknown for safety.
+ * When the specialist binary head is confident "Dog" but MobileNet's
+ * domestic dog vs domestic cat mass on the *best* crop still leans cat,
+ * trust MobileNet — typical failure mode: black kittens, funny poses, or
+ * human arms + fur confusing the binary head. Symmetric rule for "Cat"
+ * vs dog-leaning MobileNet (e.g. some terrier faces).
  */
-const FUSED_CONFIDENCE_FLOOR = 0.6;
+const DISAGREE_BINARY_MIN = 0.54;
+const DISAGREE_MOB_MARGIN = 0.045;
 
-/**
- * Weight of MobileNet (generalist) when fusing with the user-trained binary
- * head (specialist).
- *
- * 0.45 / 0.55 favours the binary head slightly because it is specifically
- * trained for cat-vs-dog discrimination — particularly useful now that we
- * feed it the pet-dominated crop (not the full frame). MobileNet still gets
- * close-to-equal weight so it can override the binary head on unusual breeds
- * where the binary head wavers (e.g., fluffy white Maltese → cat 59%).
- */
-const MOBILENET_WEIGHT = 0.45;
-
-/**
- * Pipeline:
- *   1. MobileNet OOD pass scans 6 regions (full, center, top, bottom, left,
- *      right) and returns the region with the strongest pet signal.
- *   2. petScore < PET_GATE → Unknown. Binary head not invoked.
- *   3. Otherwise run the user-trained binary head with horizontal-flip TTA
- *      on the BEST REGION — so it sees a pet-dominated patch instead of a
- *      person-dominated full frame.
- *   4. Fuse MobileNet's normalised dog/cat split (from the best region) with
- *      the binary head's probabilities.
- *   5. If the winning fused probability is below FUSED_CONFIDENCE_FLOOR,
- *      report Unknown; otherwise commit to Dog or Cat.
- */
 export async function runPrediction(
   model: tf.LayersModel,
   image: DecodedImageSource,
@@ -72,33 +58,46 @@ export async function runPrediction(
 ): Promise<PredictionOutput> {
   const petDetector = await detectPet(image);
 
-  if (petDetector.petScore < PET_GATE) {
+  if (petDetector.globalMaxPetScore < PET_GATE) {
     return makeUnknown(petDetector, "ood");
   }
 
-  // Run the trained binary head on the same region MobileNet identified as
-  // most pet-dominated. This is the key fix for the dark-kitten-with-person
-  // case: the binary head no longer has to fight with a dominant person in
-  // the frame.
-  const binary = await runBinaryHeadOnRegion(model, petDetector.bestRegion, options?.tta);
+  const binary = await ensembleBinaryHead(model, petDetector.rankedRegions, options?.tta);
 
-  // Normalise MobileNet's dog/cat scores within the pet budget so they live
-  // on the same [0,1] scale as the binary head probabilities.
-  const m = Math.max(petDetector.petScore, 1e-6);
-  const dogM = petDetector.dogScore / m;
-  const catM = petDetector.catScore / m;
+  const best = petDetector.rankedRegions[0]!;
+  const m = Math.max(best.petScore, 1e-6);
+  const dogM = best.dogScore / m;
+  const catM = best.catScore / m;
 
-  const dogFused =
+  let dogFused =
     MOBILENET_WEIGHT * dogM + (1 - MOBILENET_WEIGHT) * binary.dogProbability;
-  const catFused =
+  let catFused =
     MOBILENET_WEIGHT * catM + (1 - MOBILENET_WEIGHT) * binary.catProbability;
+
+  let label: "Dog" | "Cat" =
+    dogFused >= catFused ? "Dog" : "Cat";
+
+  // Disagreement resolver (see module comment).
+  if (
+    binary.dogProbability >= DISAGREE_BINARY_MIN &&
+    catM > dogM + DISAGREE_MOB_MARGIN
+  ) {
+    label = "Cat";
+    catFused = Math.max(catFused, binary.dogProbability);
+    dogFused = 1 - catFused;
+  } else if (
+    binary.catProbability >= DISAGREE_BINARY_MIN &&
+    dogM > catM + DISAGREE_MOB_MARGIN
+  ) {
+    label = "Dog";
+    dogFused = Math.max(dogFused, binary.catProbability);
+    catFused = 1 - dogFused;
+  }
 
   const topProb = Math.max(dogFused, catFused);
   if (topProb < FUSED_CONFIDENCE_FLOOR) {
     return makeUnknown(petDetector, "low-confidence", binary);
   }
-
-  const label: "Dog" | "Cat" = dogFused >= catFused ? "Dog" : "Cat";
 
   return {
     label,
@@ -111,13 +110,50 @@ export async function runPrediction(
   };
 }
 
+/**
+ * Average the binary head over the full frame plus up to two other strongest
+ * crops so one bad crop (mostly skin / clothing) cannot dominate.
+ */
+async function ensembleBinaryHead(
+  model: tf.LayersModel,
+  ranked: RegionScore[],
+  tta?: boolean,
+): Promise<{
+  rawSigmoid: number;
+  dogProbability: number;
+  catProbability: number;
+}> {
+  const picks: RegionScore[] = [];
+  const full = ranked.find((r) => r.name === "full");
+  if (full) picks.push(full);
+  for (const r of ranked) {
+    if (picks.some((p) => p.name === r.name)) continue;
+    if (r.petScore < 0.035) continue;
+    picks.push(r);
+    if (picks.length >= 3) break;
+  }
+  if (picks.length === 0 && ranked[0]) picks.push(ranked[0]);
+
+  let sumDog = 0;
+  let sumRaw = 0;
+  for (const r of picks) {
+    const b = await runBinaryHeadOnRegion(model, r.element, tta);
+    sumDog += b.dogProbability;
+    sumRaw += b.rawSigmoid;
+  }
+  const n = picks.length;
+  const dogProbability = sumDog / n;
+  const catProbability = 1 - dogProbability;
+  const rawSigmoid = sumRaw / n;
+
+  return { rawSigmoid, dogProbability, catProbability };
+}
+
 async function runBinaryHeadOnRegion(
   model: tf.LayersModel,
   region: Renderable,
   tta?: boolean,
 ): Promise<{ rawSigmoid: number; dogProbability: number; catProbability: number }> {
-  // preprocessFromPixels handles HTMLCanvasElement / HTMLImageElement /
-  // HTMLVideoElement via tf.browser.fromPixels.
   const input =
     region instanceof HTMLImageElement
       ? preprocessImageElement(region)
@@ -149,7 +185,7 @@ function makeUnknown(
   reason: "ood" | "low-confidence",
   binary?: { rawSigmoid: number; dogProbability: number; catProbability: number },
 ): PredictionOutput {
-  const notPetConfidence = clamp01(1 - petDetector.petScore);
+  const notPetConfidence = clamp01(1 - petDetector.globalMaxPetScore);
   return {
     label: "Not a Dog or Cat",
     rawSigmoid: binary?.rawSigmoid ?? 0,

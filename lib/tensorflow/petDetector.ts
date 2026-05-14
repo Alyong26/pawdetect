@@ -1,20 +1,14 @@
 /**
  * OOD (out-of-distribution) pet detector built on top of MobileNet ImageNet.
  *
- * The binary cat-vs-dog head in `public/model/` only knows cats and dogs.
- * Threshold its sigmoid all you want — it can still confidently misclassify a
- * person, a lion, food, etc. So we gate with MobileNet (1k ImageNet classes)
- * which DOES have a "neither" answer (anything outside the 118 dog + 5 cat
- * indices).
+ * The binary cat-vs-dog head only knows cats and dogs, so we gate with
+ * MobileNet (118 dog + 5 domestic cat ImageNet classes).
  *
- * Multi-region scanning. A single center-crop pass misses pets that are:
- *   - Off-center (cat to the side of a selfie)
- *   - Held in the lower half of the frame
- *   - Cropped at the top by a person above them
- * So we scan 6 regions and report the strongest one. The orchestrator in
- * `predict.ts` then feeds that exact region to the binary head, so the
- * trained model sees a pet-dominated patch instead of a person-dominated
- * full frame.
+ * Multi-region scanning: full frame, center, edges, corners, and a tight
+ * center crop so small or off-center pets (selfies, held kittens) still
+ * register somewhere. The orchestrator in `predict.ts` uses the strongest
+ * region for MobileNet dog/cat *split* and can ensemble the binary head
+ * across several crops.
  */
 import "@tensorflow/tfjs";
 import type { MobileNet } from "@tensorflow-models/mobilenet";
@@ -33,26 +27,29 @@ export type Renderable =
   | HTMLCanvasElement
   | HTMLVideoElement;
 
-export type PetDetectionResult = {
-  /** Coarse verdict — "neither" iff every region agreed there was no pet. */
-  kind: PetDetectionKind;
-  /** Probability mass on ImageNet dog classes in the strongest region. */
+export type RegionScore = {
+  name: string;
+  element: Renderable;
   dogScore: number;
-  /** Probability mass on ImageNet cat classes in the strongest region. */
   catScore: number;
-  /** dogScore + catScore — primary "is this a pet" signal. */
   petScore: number;
-  /** Best top-1 ImageNet label in the strongest region. */
   topLabel: string;
-  /** Probability of the top-1 label. */
   topProb: number;
-  /**
-   * The region with the highest pet signal. Use this as the binary head's
-   * input so it sees a pet-dominated patch instead of the full frame.
-   */
+};
+
+export type PetDetectionResult = {
+  kind: PetDetectionKind;
+  dogScore: number;
+  catScore: number;
+  petScore: number;
+  topLabel: string;
+  topProb: number;
   bestRegion: Renderable;
-  /** Human-readable region tag for diagnostics. */
   bestRegionName: string;
+  /** max(dog+cat) over all scanned regions — used for the OOD gate. */
+  globalMaxPetScore: number;
+  /** All regions with scores, sorted by petScore descending (for ensemble / diagnostics). */
+  rankedRegions: RegionScore[];
 };
 
 let mobilenetPromise: Promise<MobileNet> | null = null;
@@ -84,8 +81,8 @@ type Region = {
 };
 
 /**
- * Scans the image at 6 regions (full frame, center, top, bottom, left, right)
- * and returns the strongest pet signal along with the canvas of that region.
+ * Scans many crops, ranks them by pet mass, and returns the best crop plus
+ * the full ranking for downstream ensemble binary runs.
  */
 export async function detectPet(
   image: HTMLImageElement | ImageBitmap | HTMLCanvasElement | HTMLVideoElement,
@@ -94,36 +91,43 @@ export async function detectPet(
   const baseRenderable = toRenderable(image);
 
   const regions = buildRegions(baseRenderable);
-
-  let best: { region: Region; scores: PassScores } | null = null;
+  const scored: RegionScore[] = [];
 
   for (const region of regions) {
-    const scores = await scoreImage(model, region.element);
-    if (!best || scores.dogScore + scores.catScore > best.scores.dogScore + best.scores.catScore) {
-      best = { region, scores };
-    }
+    const s = await scoreImage(model, region.element);
+    scored.push({
+      name: region.name,
+      element: region.element,
+      dogScore: s.dogScore,
+      catScore: s.catScore,
+      petScore: s.dogScore + s.catScore,
+      topLabel: s.topLabel,
+      topProb: s.topProb,
+    });
   }
 
-  // regions[0] is always the full frame, so `best` is guaranteed non-null.
-  // Narrow for TS.
-  const { region: bestRegion, scores: bestScores } = best!;
-
-  const dogScore = bestScores.dogScore;
-  const catScore = bestScores.catScore;
-  const petScore = dogScore + catScore;
+  scored.sort((a, b) => b.petScore - a.petScore);
+  const best = scored[0]!;
+  const globalMaxPetScore = best.petScore;
 
   const kind: PetDetectionKind =
-    petScore <= 0 ? "neither" : dogScore >= catScore ? "dog" : "cat";
+    globalMaxPetScore <= 0
+      ? "neither"
+      : best.dogScore >= best.catScore
+        ? "dog"
+        : "cat";
 
   return {
     kind,
-    dogScore,
-    catScore,
-    petScore,
-    topLabel: bestScores.topLabel,
-    topProb: bestScores.topProb,
-    bestRegion: bestRegion.element,
-    bestRegionName: bestRegion.name,
+    dogScore: best.dogScore,
+    catScore: best.catScore,
+    petScore: best.petScore,
+    topLabel: best.topLabel,
+    topProb: best.topProb,
+    bestRegion: best.element,
+    bestRegionName: best.name,
+    globalMaxPetScore,
+    rankedRegions: scored,
   };
 }
 
@@ -137,10 +141,15 @@ function buildRegions(image: Renderable): Region[] {
     h: number;
   }> = [
     { name: "center", x: 0.15, y: 0.15, w: 0.7, h: 0.7 },
+    { name: "center-tight", x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
     { name: "top", x: 0, y: 0, w: 1, h: 0.7 },
     { name: "bottom", x: 0, y: 0.3, w: 1, h: 0.7 },
     { name: "left", x: 0, y: 0, w: 0.7, h: 1 },
     { name: "right", x: 0.3, y: 0, w: 0.7, h: 1 },
+    { name: "tl", x: 0, y: 0, w: 0.55, h: 0.55 },
+    { name: "tr", x: 0.45, y: 0, w: 0.55, h: 0.55 },
+    { name: "bl", x: 0, y: 0.45, w: 0.55, h: 0.55 },
+    { name: "br", x: 0.45, y: 0.45, w: 0.55, h: 0.55 },
   ];
   for (const t of tries) {
     const canvas = regionCrop(image, t.x, t.y, t.w, t.h);
@@ -169,9 +178,6 @@ async function scoreImage(
   try {
     const squeezed = logits.squeeze();
     const size = squeezed.size;
-    // MobileNet v2 emits [1, 1001] (background + 1k); v1 emits [1, 1000].
-    // Strip the background slot when present so our index ranges line up
-    // with the canonical ImageNet ordering.
     const aligned = size === 1001 ? squeezed.slice([1], [1000]) : squeezed;
     const probs = (await aligned.data()) as Float32Array;
 
