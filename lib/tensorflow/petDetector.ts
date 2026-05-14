@@ -165,10 +165,12 @@ function buildRegions(image: Renderable): Region[] {
 
 /**
  * Score a single region by asking MobileNet for the full sorted distribution,
- * then summing the probability mass for the 5 cat classes (anything whose
- * label contains "cat" as a whole word) and the 118 canonical ImageNet dog
- * breed labels. Label matching is robust to the background-class offset that
- * v2 model checkpoints include.
+ * then summing the probability mass for the 5 canonical ImageNet cat labels
+ * and the 118 canonical ImageNet dog breed labels — exact-string match against
+ * `IMAGENET_CAT_LABELS` / `IMAGENET_DOG_LABELS`. Earlier we used `/\bcat\b/`
+ * but that false-matched class 383 (`Madagascar cat` — a lemur) and class 387
+ * (`lesser panda, ..., bear cat, cat bear, ...` — a panda), inflating
+ * catScore on non-pet photos.
  */
 async function scoreImage(
   model: MobileNet,
@@ -187,7 +189,7 @@ async function scoreImage(
       topLabel = p.className;
     }
     const lower = p.className.toLowerCase();
-    if (CAT_LABEL_REGEX.test(lower)) {
+    if (IMAGENET_CAT_LABELS.has(lower)) {
       catScore += p.probability;
     } else if (IMAGENET_DOG_LABELS.has(lower)) {
       dogScore += p.probability;
@@ -247,11 +249,21 @@ function naturalSize(image: Renderable): { width: number; height: number } {
 }
 
 /**
- * Word-boundary match for "cat" — catches the 5 ImageNet cat classes
- * ("tabby, tabby cat", "tiger cat", "Persian cat", "Siamese cat, Siamese",
- * "Egyptian cat") without false-matching "catamaran" (472) or "catfish" (470).
+ * Canonical ImageNet labels for the 5 domestic-cat classes (indices 281–285),
+ * exactly as `MobileNet.classify()` returns them after lowercasing.
+ *
+ * Intentionally excludes class 383 (`Madagascar cat`, a lemur) and 387
+ * (`bear cat`, a panda) — they contain the word "cat" but are not cats.
+ * Also excludes 286–293 (cougar / lynx / leopard / lion / tiger / cheetah)
+ * which are wild cats, not the domestic pets this app classifies.
  */
-const CAT_LABEL_REGEX = /\bcat\b/i;
+const IMAGENET_CAT_LABELS = new Set<string>([
+  "tabby, tabby cat",
+  "tiger cat",
+  "persian cat",
+  "siamese cat, siamese",
+  "egyptian cat",
+]);
 
 /**
  * Canonical ImageNet labels for the 118 dog classes (indices 151–268),
@@ -307,7 +319,7 @@ const IMAGENET_DOG_LABELS = new Set<string>([
   "cairn, cairn terrier",
   "australian terrier",
   "dandie dinmont, dandie dinmont terrier",
-  "boston bull, boston bulldog, boston terrier, boston bull terrier",
+  "boston bull, boston terrier",
   "miniature schnauzer",
   "giant schnauzer",
   "standard schnauzer",

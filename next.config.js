@@ -8,6 +8,10 @@ const pwa = withPWA({
   disable: isDev,
   register: true,
   skipWaiting: true,
+  // Take control of already-open tabs immediately so users never get stuck on
+  // a stale build after a deploy (otherwise the new SW only controls fresh
+  // navigations and the open tab keeps running old JS until full close).
+  clientsClaim: true,
   buildExcludes: [/middleware-manifest\.json$/],
   /** Do not precache TF.js assets (large, change often; stale precache + SW bugs caused empty shards). */
   publicExcludes: ["!noprecache/**/*", "!model/**"],
