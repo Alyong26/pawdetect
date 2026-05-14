@@ -1,42 +1,78 @@
 import * as tf from "@tensorflow/tfjs";
 import { rawSigmoidToDogProbability } from "./inferConfig";
+import { detectPet, type PetDetectionResult } from "./petDetector";
+import { preprocessImageElement, type DecodedImageSource } from "./preprocess";
 
 export type ClassLabel = "Dog" | "Cat" | "Not a Dog or Cat";
 
 export type PredictionOutput = {
   /** Final classification including the Unknown class. */
   label: ClassLabel;
-  /** Raw sigmoid from the model (≈ P(Keras class 1)). */
+  /** Raw sigmoid from the binary head (≈ P(Keras class 1)). 0 when binary head was skipped. */
   rawSigmoid: number;
   /** Probability of Dog after folder-order mapping. */
   dogProbability: number;
   /** Probability of Cat (complement). */
   catProbability: number;
-  /** Confidence for the chosen pet label, 0–100 (always max(dog, cat)). */
+  /** Confidence for the displayed label, 0–100. */
   confidencePercent: number;
-  /** True if confidence falls below the Unknown threshold. */
+  /** True if the photo was classified as Not a Dog or Cat. */
   isUnknown: boolean;
+  /** Reason the photo was rejected (only set when isUnknown is true). */
+  unknownReason?: "ood" | "low-confidence";
+  /** Raw OOD scores for diagnostics. */
+  petDetector: PetDetectionResult;
 };
 
 /**
- * Confidence required (per-class probability) to commit to Dog or Cat.
- * Below this we report "Not a Dog or Cat" — useful when the input is neither
- * (the binary head can't say "unknown" by itself, so we use margin-from-0.5).
+ * Binary-head margin floor. Even when MobileNet says "this is a pet",
+ * we still require the cat-vs-dog head to commit with at least this much
+ * probability. Below the floor we fall back to "Not a Dog or Cat" to avoid
+ * coin-flip predictions like "Dog, 52%".
  */
-const PET_CONFIDENCE_THRESHOLD = 0.7;
+const BINARY_CONFIDENCE_FLOOR = 0.6;
 
 /**
- * Runs a forward pass on the preprocessed batch tensor, applies horizontal-flip
- * TTA by default, and returns Dog / Cat / "Not a Dog or Cat" based on confidence.
+ * Top-level classifier. Order of operations:
+ *   1. Run MobileNet ImageNet on the decoded image to compute dog / cat
+ *      probability mass (the OOD gate). This is what rejects cars, food,
+ *      landscapes, etc.
+ *   2. If the gate says "pet", run the binary cat-vs-dog head with TTA and
+ *      use its (calibrated) sigmoid for the final label and confidence.
+ *   3. If the binary head is on the fence (max prob < BINARY_CONFIDENCE_FLOOR),
+ *      we still report Unknown for safety.
  */
 export async function runPrediction(
   model: tf.LayersModel,
-  input: tf.Tensor4D,
+  image: DecodedImageSource,
   options?: { tta?: boolean },
 ): Promise<PredictionOutput> {
+  const petDetector = await detectPet(image);
+
+  const noBinary = {
+    rawSigmoid: 0,
+    dogProbability: petDetector.dogScore,
+    catProbability: petDetector.catScore,
+  };
+
+  if (petDetector.kind === "neither") {
+    // Show how confident we are that this is NOT a pet.
+    const notPetConfidence = clamp01(1 - petDetector.petScore);
+    return {
+      ...noBinary,
+      label: "Not a Dog or Cat",
+      confidencePercent: toPercent(notPetConfidence),
+      isUnknown: true,
+      unknownReason: "ood",
+      petDetector,
+    };
+  }
+
+  // OOD gate accepted — run the binary head for the final cat-vs-dog call.
+  const input = preprocessImageElement(image);
   const useTta = options?.tta !== false;
 
-  const logits = useTta
+  const sigmoid = useTta
     ? tf.tidy(() => {
         const p1 = model.predict(input) as tf.Tensor;
         const flipped = tf.image.flipLeftRight(input) as tf.Tensor4D;
@@ -45,25 +81,45 @@ export async function runPrediction(
       })
     : (model.predict(input) as tf.Tensor);
 
-  const data = await logits.data();
+  const data = await sigmoid.data();
   const rawSigmoid = Number(data[0]);
   const dogProbability = rawSigmoidToDogProbability(rawSigmoid);
   const catProbability = 1 - dogProbability;
 
-  logits.dispose();
+  sigmoid.dispose();
   input.dispose();
 
   const topProb = Math.max(dogProbability, catProbability);
-  const isUnknown = topProb < PET_CONFIDENCE_THRESHOLD;
   const petLabel: "Dog" | "Cat" = dogProbability >= 0.5 ? "Dog" : "Cat";
-  const label: ClassLabel = isUnknown ? "Not a Dog or Cat" : petLabel;
+
+  if (topProb < BINARY_CONFIDENCE_FLOOR) {
+    return {
+      rawSigmoid,
+      dogProbability,
+      catProbability,
+      label: "Not a Dog or Cat",
+      confidencePercent: toPercent(clamp01(1 - petDetector.petScore)),
+      isUnknown: true,
+      unknownReason: "low-confidence",
+      petDetector,
+    };
+  }
 
   return {
-    label,
     rawSigmoid,
     dogProbability,
     catProbability,
-    confidencePercent: Math.round(Math.min(1, Math.max(0, topProb)) * 1000) / 10,
-    isUnknown,
+    label: petLabel,
+    confidencePercent: toPercent(topProb),
+    isUnknown: false,
+    petDetector,
   };
+}
+
+function toPercent(p: number): number {
+  return Math.round(clamp01(p) * 1000) / 10;
+}
+
+function clamp01(p: number): number {
+  return Math.min(1, Math.max(0, p));
 }

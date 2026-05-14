@@ -33,14 +33,16 @@ export function ImageUploader({ disabled, onFileSelected }: Props) {
       onDragLeave={() => setIsDragging(false)}
       onDrop={handleDrop}
       className={[
-        "flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed px-6 py-12 text-center transition",
-        isDragging ? "border-neutral-900 bg-neutral-50" : "border-neutral-300 bg-white",
-        "hover:border-neutral-900",
+        "group flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed px-6 py-12 text-center transition-all duration-300",
+        isDragging
+          ? "scale-[1.01] border-brand bg-brand/5 shadow-sm"
+          : "border-neutral-300 bg-white",
+        "hover:-translate-y-0.5 hover:border-brand hover:shadow-sm",
         disabled ? "pointer-events-none opacity-50" : "",
       ].join(" ")}
     >
       <svg
-        className="mb-3 h-7 w-7 text-neutral-400"
+        className="mb-3 h-8 w-8 text-neutral-400 transition-colors duration-300 group-hover:text-brand"
         viewBox="0 0 24 24"
         fill="none"
         stroke="currentColor"
@@ -53,7 +55,7 @@ export function ImageUploader({ disabled, onFileSelected }: Props) {
         <polyline points="17 8 12 3 7 8" />
         <line x1="12" y1="3" x2="12" y2="15" />
       </svg>
-      <p className="text-sm font-medium text-neutral-900">Upload an image</p>
+      <p className="text-sm font-semibold text-neutral-900">Upload an image</p>
       <p className="mt-1 text-xs text-neutral-500">
         Drag and drop or click to choose · JPEG, PNG, WebP, GIF
       </p>

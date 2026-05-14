@@ -10,7 +10,7 @@ import { PredictionCard } from "@/components/PredictionCard";
 import { decodeImageForModel, isSupportedImageFile, readFileAsDataUrl } from "@/lib/imageUtils";
 import {
   loadModel,
-  preprocessImageElement,
+  loadPetDetector,
   runPrediction,
   type PredictionOutput,
 } from "@/lib/tensorflow";
@@ -40,6 +40,11 @@ export default function PawDetectShell() {
         }
         await loadModel();
         if (!cancelled) setModelStatus("ready");
+        // Kick off the ImageNet pet detector warmup in the background so the
+        // user does not pay its download cost on the first classify click.
+        void loadPetDetector().catch(() => {
+          /* if this fails, we retry lazily during classify */
+        });
       } catch (error) {
         console.error(error);
         if (!cancelled) {
@@ -91,8 +96,7 @@ export default function PawDetectShell() {
       const model = await loadModel();
       const image = await decodeImageForModel(previewUrl);
       try {
-        const tensor = preprocessImageElement(image);
-        const result = await runPrediction(model, tensor);
+        const result = await runPrediction(model, image);
         setPrediction(result);
       } finally {
         if ("close" in image && typeof (image as ImageBitmap).close === "function") {
@@ -115,22 +119,25 @@ export default function PawDetectShell() {
     <div className="flex min-h-dvh flex-col bg-neutral-50">
       <Header />
       <main className="flex-1">
-        <section className="mx-auto w-full max-w-3xl px-4 pt-12 pb-10 sm:px-6 sm:pt-16">
-          <div className="text-center">
+        <section className="mx-auto w-full max-w-3xl px-4 pt-12 pb-12 sm:px-6 sm:pt-16">
+          <div className="animate-fade-in-up text-center">
             <h1 className="text-3xl font-semibold tracking-tight text-neutral-900 sm:text-4xl">
               Classify cats and dogs from any photo.
             </h1>
-            <p className="mx-auto mt-3 max-w-xl text-sm text-neutral-600 sm:text-base">
+            <p className="mx-auto mt-3 max-w-xl text-sm leading-relaxed text-neutral-600 sm:text-base">
               Upload an image and PawDetect will tell you if it&apos;s a dog, a cat, or
               something else — running entirely in your browser.
             </p>
           </div>
 
-          <div className="mt-10 space-y-6">
+          <div
+            className="mt-10 space-y-6 animate-fade-in-up"
+            style={{ animationDelay: "80ms" }}
+          >
             <ImageUploader disabled={disabled} onFileSelected={handleFile} />
 
             {previewUrl ? (
-              <div className="overflow-hidden rounded-2xl border border-neutral-200 bg-white">
+              <div className="animate-scale-in overflow-hidden rounded-2xl border border-neutral-200 bg-white shadow-sm">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={previewUrl}
@@ -144,7 +151,7 @@ export default function PawDetectShell() {
               type="button"
               onClick={handlePredict}
               disabled={!previewUrl || disabled}
-              className="inline-flex w-full items-center justify-center rounded-xl bg-neutral-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:bg-neutral-300"
+              className="group inline-flex w-full items-center justify-center gap-2 rounded-xl bg-neutral-900 px-4 py-3 text-sm font-semibold text-white transition-all duration-300 hover:-translate-y-0.5 hover:bg-brand hover:shadow-md disabled:cursor-not-allowed disabled:translate-y-0 disabled:bg-neutral-300 disabled:shadow-none"
             >
               {predicting
                 ? "Analyzing…"
@@ -154,19 +161,20 @@ export default function PawDetectShell() {
             </button>
 
             {userError ? (
-              <p className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <p className="animate-fade-in rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
                 {userError}
               </p>
             ) : null}
             {modelError ? (
-              <p className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              <p className="animate-fade-in rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
                 {modelError}
               </p>
             ) : null}
 
             {predicting || modelStatus === "loading" ? (
               <LoadingSpinner
-                label={modelStatus === "loading" ? "Loading model…" : "Analyzing…"}
+                variant="brand"
+                label={modelStatus === "loading" ? "Loading model…" : "Analyzing image…"}
               />
             ) : (
               <PredictionCard result={prediction} />
