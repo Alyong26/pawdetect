@@ -1,14 +1,8 @@
 import * as tf from "@tensorflow/tfjs";
 import { rawSigmoidToDogProbability } from "./inferConfig";
-import {
-  detectPet,
-  type PetDetectionResult,
-  type Renderable,
-  type RegionScore,
-} from "./petDetector";
+import { detectPet, type PetDetectionResult } from "./petDetector";
 import {
   preprocessFromPixels,
-  preprocessImageElement,
   type DecodedImageSource,
 } from "./preprocess";
 
@@ -17,39 +11,29 @@ export type ClassLabel = "Dog" | "Cat" | "Not a Dog or Cat";
 export type PredictionOutput = {
   /** Final classification including the Unknown class. */
   label: ClassLabel;
-  /** Raw sigmoid from the trained binary head on the primary crop (≈ P(class 1)). */
+  /** Raw sigmoid from the trained binary head, ≈ P(class 1) = P(Dog). 0 when not invoked. */
   rawSigmoid: number;
-  /** Final probability for Dog after ensemble + fusion / overrides. */
+  /** Final probability for Dog after COCO-SSD + binary-head fusion. */
   dogProbability: number;
-  /** Final probability for Cat. */
+  /** Final probability for Cat after COCO-SSD + binary-head fusion. */
   catProbability: number;
   /** Confidence for the displayed label, 0–100. */
   confidencePercent: number;
   isUnknown: boolean;
-  unknownReason?: "ood" | "low-confidence";
+  unknownReason?: "ood";
   petDetector: PetDetectionResult;
 };
 
 /**
- * OOD gate on the strongest crop anywhere in the frame. Slightly below 0.12
- * because we now add corner + tight-center crops that lift true pets without
- * lifting random non-pet photos much (they stay near 0 everywhere).
+ * Strict OOD gate. A photo must have at least one COCO-SSD "cat" or "dog"
+ * detection with score >= this to be classified as a pet at all.
+ *
+ * 0.5 is intentionally strict: lions / wolves / vehicles / food / people /
+ * plants reliably score well below 0.5 because COCO-SSD didn't learn to
+ * detect them as cat-or-dog. Domestic cats and dogs (the classes the model
+ * was trained to detect) regularly score >= 0.7.
  */
-const PET_GATE = 0.09;
-
-const FUSED_CONFIDENCE_FLOOR = 0.58;
-
-const MOBILENET_WEIGHT = 0.42;
-
-/**
- * When the specialist binary head is confident "Dog" but MobileNet's
- * domestic dog vs domestic cat mass on the *best* crop still leans cat,
- * trust MobileNet — typical failure mode: black kittens, funny poses, or
- * human arms + fur confusing the binary head. Symmetric rule for "Cat"
- * vs dog-leaning MobileNet (e.g. some terrier faces).
- */
-const DISAGREE_BINARY_MIN = 0.54;
-const DISAGREE_MOB_MARGIN = 0.045;
+const PET_GATE = 0.5;
 
 export async function runPrediction(
   model: tf.LayersModel,
@@ -58,107 +42,71 @@ export async function runPrediction(
 ): Promise<PredictionOutput> {
   const petDetector = await detectPet(image);
 
-  if (petDetector.globalMaxPetScore < PET_GATE) {
-    return makeUnknown(petDetector, "ood");
+  if (petDetector.petScore < PET_GATE) {
+    return makeUnknown(petDetector);
   }
 
-  const binary = await ensembleBinaryHead(model, petDetector.rankedRegions, options?.tta);
+  // COCO-SSD has located the pet's bounding box. Run the user's trained binary
+  // head on that crop so it sees pet-centric pixels instead of "person + tiny
+  // pet in the corner". This is what makes the binary head's specialist
+  // training pay off in selfies and held-pet photos.
+  const binary = await runBinaryHead(model, petDetector.bestRegion, options?.tta);
 
-  const best = petDetector.rankedRegions[0]!;
-  const m = Math.max(best.petScore, 1e-6);
-  const dogM = best.dogScore / m;
-  const catM = best.catScore / m;
+  // COCO-SSD is the primary verdict. It's specifically trained to distinguish
+  // cats vs dogs vs everything else and won't get fooled by the colour-bias
+  // patterns the user's binary head sometimes learns on a small dataset.
+  // The binary head only adjusts the displayed confidence — it cannot flip
+  // the dog/cat verdict.
+  const cocoVerdict: "Dog" | "Cat" = petDetector.kind === "dog" ? "Dog" : "Cat";
+  const binaryVerdict: "Dog" | "Cat" =
+    binary.dogProbability >= 0.5 ? "Dog" : "Cat";
+  const agreement = cocoVerdict === binaryVerdict;
 
-  let dogFused =
-    MOBILENET_WEIGHT * dogM + (1 - MOBILENET_WEIGHT) * binary.dogProbability;
-  let catFused =
-    MOBILENET_WEIGHT * catM + (1 - MOBILENET_WEIGHT) * binary.catProbability;
+  const cocoConfidence = petDetector.petScore;
+  const binaryConfidence =
+    cocoVerdict === "Dog" ? binary.dogProbability : binary.catProbability;
 
-  let label: "Dog" | "Cat" =
-    dogFused >= catFused ? "Dog" : "Cat";
-
-  // Disagreement resolver (see module comment).
-  if (
-    binary.dogProbability >= DISAGREE_BINARY_MIN &&
-    catM > dogM + DISAGREE_MOB_MARGIN
-  ) {
-    label = "Cat";
-    catFused = Math.max(catFused, binary.dogProbability);
-    dogFused = 1 - catFused;
-  } else if (
-    binary.catProbability >= DISAGREE_BINARY_MIN &&
-    dogM > catM + DISAGREE_MOB_MARGIN
-  ) {
-    label = "Dog";
-    dogFused = Math.max(dogFused, binary.catProbability);
-    catFused = 1 - dogFused;
-  }
-
-  const topProb = Math.max(dogFused, catFused);
-  if (topProb < FUSED_CONFIDENCE_FLOOR) {
-    return makeUnknown(petDetector, "low-confidence", binary);
-  }
+  /**
+   * Weighted confidence:
+   *   - When COCO-SSD and the binary head agree, blend (65/35) so a
+   *     confident binary head can push a 70% detection up toward 85%.
+   *   - When they disagree, lean heavily on COCO-SSD (it caught the actual
+   *     object) and just dampen confidence a bit so the result honestly
+   *     reflects that the two signals disagree.
+   */
+  const finalConfidence = agreement
+    ? clamp01(0.65 * cocoConfidence + 0.35 * binaryConfidence)
+    : clamp01(Math.max(cocoConfidence * 0.9, 0.5));
 
   return {
-    label,
+    label: cocoVerdict,
     rawSigmoid: binary.rawSigmoid,
-    dogProbability: dogFused,
-    catProbability: catFused,
-    confidencePercent: toPercent(topProb),
+    dogProbability:
+      cocoVerdict === "Dog" ? finalConfidence : 1 - finalConfidence,
+    catProbability:
+      cocoVerdict === "Cat" ? finalConfidence : 1 - finalConfidence,
+    confidencePercent: toPercent(finalConfidence),
     isUnknown: false,
     petDetector,
   };
 }
 
 /**
- * Average the binary head over the full frame plus up to two other strongest
- * crops so one bad crop (mostly skin / clothing) cannot dominate.
+ * Run the user's trained binary head on a single canvas (the pet crop).
+ * TTA defaults to OFF — COCO-SSD already gives a strong primary signal, and
+ * one extra forward pass per classify just slows things down.
  */
-async function ensembleBinaryHead(
+async function runBinaryHead(
   model: tf.LayersModel,
-  ranked: RegionScore[],
+  region: HTMLCanvasElement,
   tta?: boolean,
 ): Promise<{
   rawSigmoid: number;
   dogProbability: number;
   catProbability: number;
 }> {
-  const picks: RegionScore[] = [];
-  const full = ranked.find((r) => r.name === "full");
-  if (full) picks.push(full);
-  for (const r of ranked) {
-    if (picks.some((p) => p.name === r.name)) continue;
-    if (r.petScore < 0.035) continue;
-    picks.push(r);
-    if (picks.length >= 3) break;
-  }
-  if (picks.length === 0 && ranked[0]) picks.push(ranked[0]);
-
-  let sumDog = 0;
-  let sumRaw = 0;
-  for (const r of picks) {
-    const b = await runBinaryHeadOnRegion(model, r.element, tta);
-    sumDog += b.dogProbability;
-    sumRaw += b.rawSigmoid;
-  }
-  const n = picks.length;
-  const dogProbability = sumDog / n;
-  const catProbability = 1 - dogProbability;
-  const rawSigmoid = sumRaw / n;
-
-  return { rawSigmoid, dogProbability, catProbability };
-}
-
-async function runBinaryHeadOnRegion(
-  model: tf.LayersModel,
-  region: Renderable,
-  tta?: boolean,
-): Promise<{ rawSigmoid: number; dogProbability: number; catProbability: number }> {
-  const input =
-    region instanceof HTMLImageElement
-      ? preprocessImageElement(region)
-      : preprocessFromPixels(region as HTMLCanvasElement | HTMLVideoElement);
-  const useTta = tta !== false;
+  const input = preprocessFromPixels(region);
+  const useTta = tta === true;
 
   const sigmoid = useTta
     ? tf.tidy(() => {
@@ -180,20 +128,16 @@ async function runBinaryHeadOnRegion(
   return { rawSigmoid, dogProbability, catProbability };
 }
 
-function makeUnknown(
-  petDetector: PetDetectionResult,
-  reason: "ood" | "low-confidence",
-  binary?: { rawSigmoid: number; dogProbability: number; catProbability: number },
-): PredictionOutput {
-  const notPetConfidence = clamp01(1 - petDetector.globalMaxPetScore);
+function makeUnknown(petDetector: PetDetectionResult): PredictionOutput {
+  const notPetConfidence = clamp01(1 - petDetector.petScore);
   return {
     label: "Not a Dog or Cat",
-    rawSigmoid: binary?.rawSigmoid ?? 0,
-    dogProbability: binary?.dogProbability ?? petDetector.dogScore,
-    catProbability: binary?.catProbability ?? petDetector.catScore,
+    rawSigmoid: 0,
+    dogProbability: petDetector.dogScore,
+    catProbability: petDetector.catScore,
     confidencePercent: toPercent(notPetConfidence),
     isUnknown: true,
-    unknownReason: reason,
+    unknownReason: "ood",
     petDetector,
   };
 }
