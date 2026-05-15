@@ -33,11 +33,11 @@ export function ImageUploader({ disabled, onFileSelected }: Props) {
       onDragLeave={() => setIsDragging(false)}
       onDrop={handleDrop}
       className={[
-        "group flex cursor-pointer flex-col items-center justify-center rounded-2xl border border-dashed px-6 py-14 text-center transition-all duration-300",
+        "group flex min-h-[180px] cursor-pointer touch-manipulation flex-col items-center justify-center rounded-2xl border border-dashed px-4 py-10 text-center transition-all duration-300 sm:min-h-[200px] sm:px-6 sm:py-14",
         isDragging
-          ? "scale-[1.01] border-brand bg-brand/[0.04] shadow-elev"
+          ? "border-brand bg-brand/[0.04] shadow-elev"
           : "border-neutral-300 bg-white/80 backdrop-blur",
-        "hover:-translate-y-0.5 hover:border-brand hover:bg-white hover:shadow-elev",
+        "active:scale-[0.99] sm:hover:-translate-y-0.5 sm:hover:border-brand sm:hover:bg-white sm:hover:shadow-elev motion-reduce:transition-none motion-reduce:sm:hover:translate-y-0",
         disabled ? "pointer-events-none opacity-50" : "",
       ].join(" ")}
     >
@@ -57,13 +57,13 @@ export function ImageUploader({ disabled, onFileSelected }: Props) {
           <line x1="12" y1="3" x2="12" y2="15" />
         </svg>
       </div>
-      <p className="text-sm font-semibold text-neutral-900">
+      <p className="text-sm font-semibold leading-snug text-neutral-900 sm:text-base">
         Upload a clear photo of a dog or cat
       </p>
-      <p className="mt-1 text-xs text-neutral-500">
+      <p className="mt-1 max-w-[28ch] text-pretty text-xs text-neutral-500 sm:max-w-none sm:text-sm">
         Drag and drop or click to choose · JPEG, PNG, WebP, GIF
       </p>
-      <p className="mt-3 max-w-xs text-[11px] leading-relaxed text-neutral-400">
+      <p className="mt-3 max-w-[34ch] text-pretty text-[11px] leading-relaxed text-neutral-400 sm:max-w-md sm:text-xs">
         Tip: well-lit, close-up shots where the pet&apos;s face is visible give
         the most accurate results.
       </p>

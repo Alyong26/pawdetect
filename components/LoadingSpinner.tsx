@@ -16,7 +16,7 @@ export function LoadingSpinner({ label = "Analyzing…", variant = "neutral" }: 
 
   return (
     <div
-      className="flex flex-col items-center justify-center gap-3 py-6 text-neutral-600"
+      className="flex flex-col items-center justify-center gap-3 px-2 py-6 text-neutral-600"
       role="status"
       aria-live="polite"
     >
@@ -29,7 +29,9 @@ export function LoadingSpinner({ label = "Analyzing…", variant = "neutral" }: 
           />
         ))}
       </div>
-      <span className="text-sm font-medium tracking-tight">{label}</span>
+      <span className="max-w-[min(100%,20rem)] text-center text-sm font-medium tracking-tight sm:max-w-none">
+        {label}
+      </span>
     </div>
   );
 }

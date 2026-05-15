@@ -35,6 +35,7 @@ export const viewport: Viewport = {
   width: "device-width",
   initialScale: 1,
   maximumScale: 5,
+  viewportFit: "cover",
 };
 
 export default function RootLayout({
@@ -44,7 +45,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" className={inter.variable}>
-      <body className="min-h-dvh bg-neutral-50 text-neutral-900 antialiased">
+      <body className="min-h-dvh min-w-0 bg-neutral-50 text-neutral-900 antialiased">
         {children}
       </body>
     </html>

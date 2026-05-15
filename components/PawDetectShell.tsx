@@ -116,34 +116,34 @@ export default function PawDetectShell() {
   }, [modelStatus, previewUrl]);
 
   return (
-    <div className="relative isolate flex min-h-dvh flex-col bg-neutral-50">
+    <div className="relative isolate flex min-h-dvh min-w-0 flex-col bg-neutral-50">
       {/* Ambient backdrop — subtle brand-tinted glow behind the hero. */}
       <div
         aria-hidden
-        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[480px] bg-gradient-to-b from-brand/[0.045] via-white/40 to-transparent"
+        className="pointer-events-none absolute inset-x-0 top-0 -z-10 h-[min(480px,100svh)] bg-gradient-to-b from-brand/[0.045] via-white/40 to-transparent"
       />
       <div
         aria-hidden
-        className="pointer-events-none absolute left-1/2 top-28 -z-10 h-[320px] w-[820px] -translate-x-1/2 rounded-full bg-brand/5 blur-3xl"
+        className="pointer-events-none absolute left-1/2 top-20 -z-10 h-[min(320px,55vw)] w-[min(100vw,820px)] max-w-full -translate-x-1/2 rounded-full bg-brand/5 blur-3xl sm:top-28"
       />
 
       <Header />
-      <main className="flex-1">
-        <section className="mx-auto w-full max-w-3xl px-4 pt-14 pb-16 sm:px-6 sm:pt-20">
-          <div className="animate-fade-in-up text-center">
-            <h1 className="text-4xl font-semibold tracking-tight text-neutral-900 sm:text-5xl">
+      <main className="flex min-h-0 min-w-0 flex-1">
+        <section className="mx-auto w-full min-w-0 max-w-3xl px-safe pt-10 pb-12 sm:pt-16 sm:pb-16 md:max-w-4xl md:pt-20">
+          <div className="animate-fade-in-up text-balance text-center">
+            <h1 className="text-[1.65rem] font-semibold leading-tight tracking-tight text-neutral-900 sm:text-4xl md:text-5xl">
               Classify cats and dogs
               <br className="hidden sm:block" />{" "}
               <span className="text-brand">from any photo.</span>
             </h1>
-            <p className="mx-auto mt-4 max-w-xl text-sm leading-relaxed text-neutral-600 sm:text-base">
+            <p className="mx-auto mt-3 max-w-xl px-1 text-sm leading-relaxed text-neutral-600 sm:mt-4 sm:text-base md:max-w-2xl">
               Upload an image and PawDetect will tell you if it&apos;s a dog, a cat,
               or something else — running entirely in your browser.
             </p>
           </div>
 
           <div
-            className="mt-12 space-y-6 animate-fade-in-up"
+            className="mt-8 space-y-5 animate-fade-in-up sm:mt-12 sm:space-y-6"
             style={{ animationDelay: "80ms" }}
           >
             <ImageUploader disabled={disabled} onFileSelected={handleFile} />
@@ -153,8 +153,8 @@ export default function PawDetectShell() {
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={previewUrl}
-                  alt="Selected"
-                  className="mx-auto max-h-80 w-full object-contain"
+                  alt="Selected preview"
+                  className="mx-auto max-h-[min(70svh,22rem)] w-full object-contain sm:max-h-80 md:max-h-[28rem]"
                 />
               </div>
             ) : null}
@@ -163,7 +163,7 @@ export default function PawDetectShell() {
               type="button"
               onClick={handlePredict}
               disabled={!previewUrl || disabled}
-              className="group inline-flex w-full items-center justify-center gap-2 rounded-xl bg-neutral-900 px-4 py-3.5 text-sm font-semibold text-white shadow-elev transition-all duration-300 hover:-translate-y-0.5 hover:bg-brand hover:shadow-lg disabled:cursor-not-allowed disabled:translate-y-0 disabled:bg-neutral-300 disabled:shadow-none"
+              className="group inline-flex min-h-[48px] w-full touch-manipulation items-center justify-center gap-2 rounded-xl bg-neutral-900 px-4 py-3.5 text-sm font-semibold text-white shadow-elev transition-colors duration-200 hover:bg-brand hover:shadow-lg active:bg-brand/90 disabled:cursor-not-allowed disabled:bg-neutral-300 disabled:shadow-none md:min-h-[52px] md:text-base lg:hover:-translate-y-0.5 lg:disabled:translate-y-0 motion-reduce:lg:hover:translate-y-0"
             >
               {predicting
                 ? "Analyzing…"
@@ -173,12 +173,12 @@ export default function PawDetectShell() {
             </button>
 
             {userError ? (
-              <p className="animate-fade-in rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <p className="animate-fade-in rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm leading-snug text-red-700 break-words">
                 {userError}
               </p>
             ) : null}
             {modelError ? (
-              <p className="animate-fade-in rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+              <p className="animate-fade-in rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm leading-snug text-amber-800 break-words">
                 {modelError}
               </p>
             ) : null}

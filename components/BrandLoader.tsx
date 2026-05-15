@@ -10,8 +10,8 @@ type Props = {
  */
 export function BrandLoader({ label = "Loading PawDetect…" }: Props) {
   return (
-    <div className="flex min-h-dvh flex-col items-center justify-center bg-neutral-50 px-6">
-      <div className="flex flex-col items-center gap-6">
+    <div className="flex min-h-dvh min-w-0 flex-col items-center justify-center bg-neutral-50 px-safe py-8">
+      <div className="flex max-w-md flex-col items-center gap-5 sm:gap-6">
         <div className="relative">
           <div
             aria-hidden
@@ -23,7 +23,7 @@ export function BrandLoader({ label = "Loading PawDetect…" }: Props) {
             width={220}
             height={66}
             priority
-            className="relative h-16 w-auto animate-breath"
+            className="relative h-14 w-auto animate-breath sm:h-16"
           />
         </div>
         <div className="flex items-end gap-2">
@@ -43,7 +43,7 @@ export function BrandLoader({ label = "Loading PawDetect…" }: Props) {
             </svg>
           ))}
         </div>
-        <p className="text-sm font-medium text-neutral-500">{label}</p>
+        <p className="text-center text-sm font-medium text-neutral-500 sm:text-base">{label}</p>
       </div>
     </div>
   );

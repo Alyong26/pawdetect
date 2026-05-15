@@ -4,11 +4,42 @@
 
 html {
   scroll-behavior: smooth;
+  overflow-x: hidden;
+  /* Prevent iOS from inflating small text in landscape. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
   font-feature-settings: "rlig" 1, "calt" 1;
   -webkit-font-smoothing: antialiased;
+  min-width: 0;
+}
+
+@layer utilities {
+  /**
+   * Horizontal padding that respects notches / home indicators on phones
+   * and keeps at least 1rem gutter on narrow screens.
+   */
+  .px-safe {
+    padding-left: max(1rem, env(safe-area-inset-left, 0px));
+    padding-right: max(1rem, env(safe-area-inset-right, 0px));
+  }
+
+  @media (min-width: 640px) {
+    .px-safe {
+      padding-left: max(1.5rem, env(safe-area-inset-left, 0px));
+      padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
+    }
+  }
+
+  .pt-safe {
+    padding-top: max(0.5rem, env(safe-area-inset-top, 0px));
+  }
+
+  .pb-safe {
+    padding-bottom: max(0.75rem, env(safe-area-inset-bottom, 0px));
+  }
 }
 
 /* Layered soft elevation used by hero cards and the prediction card. */
